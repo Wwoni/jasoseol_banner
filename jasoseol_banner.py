@@ -202,6 +202,58 @@ def main():
     # 실행 로그 및 디버그 타임스탬프
     with open("last_run.txt", "w", encoding="utf-8") as f:
         f.write(datetime.now().isoformat())
+        
+    from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google.oauth2 import service_account
+import os
+
+def upload_to_gdrive(file_path: str, drive_id: str, folder_id: str | None = None):
+    # Secret에 저장한 JSON 키 불러오기
+    creds_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    if not creds_json:
+        raise RuntimeError("환경변수 GCP_SERVICE_ACCOUNT_JSON 이 없습니다.")
+    
+    creds_dict = json.loads(creds_json)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/drive.file",
+                "https://www.googleapis.com/auth/drive"]
+    )
+
+    service = build("drive", "v3", credentials=creds)
+
+    file_metadata = {
+        "name": os.path.basename(file_path),
+        "driveId": drive_id,
+        "parents": [folder_id] if folder_id else None
+    }
+    media = MediaFileUpload(file_path, mimetype="text/csv")
+
+    uploaded = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        supportsAllDrives=True,
+        fields="id, name"
+    ).execute()
+
+    print(f"[OK] Google Drive 업로드 완료 → {uploaded.get('name')} (id={uploaded.get('id')})")
+
+def main():
+    html = fetch_html(BASE_URL)
+    soup = BeautifulSoup(html, "lxml")
+    rows = collect_from_static_dom(soup) or collect_from_next_data(soup) or collect_fallback_imgs(soup)
+    df = pd.DataFrame(rows).drop_duplicates()
+
+    out_csv = "jasoseol_banner.csv"
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    print(f"[OK] {len(df)}개 배너 수집 완료 → {out_csv}")
+
+    # Google Drive 업로드 호출
+    drive_id = os.environ.get("GDRIVE_ID")       # 공유드라이브 ID
+    folder_id = os.environ.get("GDRIVE_FOLDER")  # 업로드할 폴더 ID (없으면 공유드라이브 루트)
+    if drive_id:
+        upload_to_gdrive(out_csv, drive_id, folder_id)
 
 if __name__ == "__main__":
     main()
