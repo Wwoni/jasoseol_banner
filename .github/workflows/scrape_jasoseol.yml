@@ -27,12 +27,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scraper
+      # (1) 서비스계정 JSON 파일 생성
+      - name: Write service account JSON
+        shell: bash
+        env:
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}  # <-- 리포 Secrets에 저장한 JSON 원문
+        run: |
+          printf '%s' "$GDRIVE_SA_JSON" > gdrive_sa.json
+
+      # (2) 크롤링 + 드라이브 업로드 실행
+      - name: Run crawler & upload
+        env:
+          # 필수: 공유드라이브 내 '대상 폴더 ID'
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          # 선택: 공유드라이브 ID(검색 최적화)
+          GDRIVE_DRIVE_ID: ${{ secrets.GDRIVE_DRIVE_ID }}
+          # 선택: 서비스계정 JSON 경로(기본 gdrive_sa.json)
+          GDRIVE_SA_JSON_PATH: gdrive_sa.json
         run: |
           python jasoseol_banner.py
 
-      # (옵션 1) 결과물을 아티팩트로 업로드(저장 전용)
-      - name: Upload artifacts (CSV + Debug)
+      # (옵션) 결과물/디버그 아티팩트 업로드
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: jasoseol_banner_outputs
@@ -42,16 +58,3 @@ jobs:
             debug_home.html
             debug_next_data.json
           if-no-files-found: warn
-
-      # (옵션 2) 리포지토리에 커밋(변경 추적/버전관리)
-      - name: Commit & push if changed
-        run: |
-          git config user.name "${{ github.actor }}"
-          git config user.email "${{ github.actor }}@users.noreply.github.com"
-          git add jasoseol_banner.csv last_run.txt || true
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: update jasoseol_banner.csv [ci skip]"
-            git push
-          else
-            echo "No changes to commit."
-          fi
