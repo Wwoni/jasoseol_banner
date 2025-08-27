@@ -1,0 +1,55 @@
+name: Scrape Jasoseol Banners
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 매주 월요일 01:00 UTC 실행 = 한국시간(KST, UTC+9) 오전(10:00)
+    - cron: "0 1 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        run: |
+          python scrape_jasoseol_banners.py
+
+      # (옵션 1) 결과물을 아티팩트로 업로드(저장 전용)
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jasoseol_banner_csv
+          path: |
+            jasoseol_banner.csv
+            last_run.txt
+          if-no-files-found: warn
+
+      # (옵션 2) 리포지토리에 커밋(변경 추적/버전관리)
+      - name: Commit & push if changed
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          git add jasoseol_banner.csv last_run.txt || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update jasoseol_banner.csv [ci skip]"
+            git push
+          else
+            echo "No changes to commit."
+          fi
