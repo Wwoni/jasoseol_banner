@@ -1,80 +1,205 @@
+import re
+import json
 import requests
-from bs4 import BeautifulSoup
 import pandas as pd
-from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
 from datetime import datetime
+from typing import Any, Iterable
 
 BASE_URL = "https://jasoseol.com/"
 
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+IMG_EXT_RE = re.compile(r"\.(?:png|jpg|jpeg|webp|gif)(?:\?.*)?$", re.IGNORECASE)
+
 def fetch_html(url: str) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-    resp = requests.get(url, headers=headers, timeout=15)
+    resp = requests.get(url, headers={"User-Agent": UA}, timeout=20)
     resp.raise_for_status()
     return resp.text
 
-def parse_srcset_to_urls(srcset: str, base: str) -> list:
-    """
-    srcset 문자열에서 url 부분만 절대경로로 추출.
-    원래 코드 로직처럼 '마지막 항목 제외'까지 반영.
-    """
+def safe_urljoin(base: str, maybe_url: str | None) -> str:
+    if not maybe_url:
+        return ""
+    return urljoin(base, maybe_url)
+
+def parse_srcset(srcset: str, base: str) -> list[str]:
     if not srcset:
         return []
     parts = [p.strip() for p in srcset.split(",") if p.strip()]
-    # 마지막 항목 제외
-    parts = parts[:-1] if len(parts) > 1 else parts
+    # 원 요청 로직: 마지막 항목 제외
+    if len(parts) > 1:
+        parts = parts[:-1]
     urls = []
     for p in parts:
-        # "url width" 형태에서 url만
         url_only = p.split()[0]
-        abs_url = urljoin(base, url_only)
-        urls.append(abs_url)
+        urls.append(safe_urljoin(base, url_only))
     return urls
 
-def scrape_banners(html: str) -> pd.DataFrame:
-    soup = BeautifulSoup(html, "lxml")
-    banners = soup.select(".main-banner-ggs")
+def collect_from_static_dom(soup: BeautifulSoup) -> list[dict]:
     rows = []
-    for b in banners:
-        a = b.find("a")
-        img = b.find("img")
-        link = urljoin(BASE_URL, a.get("href")) if a and a.get("href") else None
-        alt = img.get("alt") if img and img.get("alt") else ""
-        srcset = img.get("srcset") if img and img.get("srcset") else ""
-        # srcset -> URL 리스트(절대경로), 마지막 항목 제외 로직 반영
-        srcset_urls = parse_srcset_to_urls(srcset, BASE_URL)
-        # 원래 코드처럼 ", " 로 조인
-        modified_srcset = ", ".join(srcset_urls)
 
-        # 대체로 src(단일)도 같이 저장해두면 분석에 유용
-        src = urljoin(BASE_URL, img.get("src")) if img and img.get("src") else ""
+    # 1) 원래 셀렉터
+    candidates = soup.select(".main-banner-ggs")
 
-        if link or src or modified_srcset:
-            rows.append(
-                {
-                    "Link": link or "",
-                    "Alt": alt,
-                    "Src": src,
-                    "Srcset_Modified": modified_srcset,
-                }
-            )
-    return pd.DataFrame(rows)
+    # 2) 흔한 배너 패턴(예: swiper/picture/img)
+    if not candidates:
+        candidates = soup.select(
+            ".swiper .swiper-slide, .banner, .main-banner, .main_banner"
+        )
+
+    for node in candidates:
+        a = node.find("a")
+        img = node.find("img")
+        link = safe_urljoin(BASE_URL, a.get("href") if a else "")
+        alt = img.get("alt") if img else ""
+        src = safe_urljoin(BASE_URL, img.get("src") if img else "")
+        srcset = img.get("srcset") if img else ""
+        srcset_urls = parse_srcset(srcset, BASE_URL)
+        rows.append(
+            {
+                "Link": link,
+                "Alt": alt or "",
+                "Src": src,
+                "Srcset_Modified": ", ".join(srcset_urls),
+                "Source": "static_dom",
+            }
+        )
+    return rows
+
+def deep_iter(v: Any) -> Iterable[str]:
+    """JSON 등 임의의 중첩 구조에서 문자열만 뽑아냄."""
+    if isinstance(v, dict):
+        for k, vv in v.items():
+            yield from deep_iter(vv)
+    elif isinstance(v, list):
+        for vv in v:
+            yield from deep_iter(vv)
+    elif isinstance(v, str):
+        yield v
+
+def looks_like_img(url: str) -> bool:
+    if not url:
+        return False
+    if IMG_EXT_RE.search(url):
+        return True
+    # Next.js 이미지는 /_next/image?url=... 형태일 수 있음 → 원본 URL 추출
+    if "/_next/image" in url and "url=" in url:
+        return True
+    return False
+
+def normalize_img_url(url: str) -> str:
+    # /_next/image?url=encoded&... → 실제 원본 URL로 교체 시도
+    if "/_next/image" in url and "url=" in url:
+        try:
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(url).query)
+            raw = qs.get("url", [""])[0]
+            if raw:
+                return safe_urljoin(BASE_URL, raw)
+        except Exception:
+            pass
+    return safe_urljoin(BASE_URL, url)
+
+def collect_from_next_data(soup: BeautifulSoup) -> list[dict]:
+    rows = []
+    tag = soup.find("script", id="__NEXT_DATA__")
+    if not tag or not tag.text:
+        return rows
+
+    # 디버깅용 저장
+    with open("debug_next_data.json", "w", encoding="utf-8") as f:
+        f.write(tag.text)
+
+    try:
+        data = json.loads(tag.text)
+    except Exception:
+        return rows
+
+    # 모든 문자열 중 이미지 URL 후보 수집
+    images = []
+    links = []
+    for s in deep_iter(data):
+        if looks_like_img(s):
+            images.append(normalize_img_url(s))
+        # a태그 href 대신 라우팅 path만 있는 경우 대비
+        # (ex) "/events/123" 같은 path
+        elif isinstance(s, str) and s.startswith("/"):
+            links.append(safe_urljoin(BASE_URL, s))
+
+    # 중복 제거
+    images = list(dict.fromkeys(images))
+    links = list(dict.fromkeys(links))
+
+    # 이미지/링크 매칭은 정확치 않으므로, 우선 이미지 기준 행 생성
+    for img_url in images:
+        rows.append(
+            {
+                "Link": links[0] if links else "",
+                "Alt": "",
+                "Src": img_url,
+                "Srcset_Modified": "",
+                "Source": "__NEXT_DATA__",
+            }
+        )
+
+    return rows
+
+def collect_fallback_imgs(soup: BeautifulSoup) -> list[dict]:
+    """정말 아무것도 못 찾았을 때, 페이지 내의 모든 <img>를 수집(보수적)."""
+    rows = []
+    imgs = soup.find_all("img")
+    for img in imgs:
+        src = normalize_img_url(img.get("src") or "")
+        if not src or not looks_like_img(src):
+            continue
+        alt = img.get("alt") or ""
+        srcset_urls = parse_srcset(img.get("srcset") or "", BASE_URL)
+        rows.append(
+            {
+                "Link": "",
+                "Alt": alt,
+                "Src": src,
+                "Srcset_Modified": ", ".join(srcset_urls),
+                "Source": "fallback_img",
+            }
+        )
+    return rows
 
 def main():
     html = fetch_html(BASE_URL)
-    df = scrape_banners(html)
 
-    # 타임스탬프 포함 파일명(옵션) 또는 고정 파일명
+    # 디버그: 원문 저장
+    with open("debug_home.html", "w", encoding="utf-8") as f:
+        f.write(html)
+
+    soup = BeautifulSoup(html, "lxml")
+
+    rows = []
+    rows += collect_from_static_dom(soup)
+    if not rows:
+        rows += collect_from_next_data(soup)
+    if not rows:
+        rows += collect_fallback_imgs(soup)
+
+    # 정제: 완전 빈 행 제거
+    cleaned = [
+        r for r in rows
+        if any([r.get("Link"), r.get("Src"), r.get("Srcset_Modified")])
+    ]
+
+    df = pd.DataFrame(cleaned).drop_duplicates()
+
     out_csv = "jasoseol_banner.csv"
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
     print(f"[OK] {len(df)}개 배너 수집 완료 → {out_csv}")
-    # 변경 추적 위한 로그 파일(선택)
+
+    # 실행 로그 및 디버그 타임스탬프
     with open("last_run.txt", "w", encoding="utf-8") as f:
         f.write(datetime.now().isoformat())
 
