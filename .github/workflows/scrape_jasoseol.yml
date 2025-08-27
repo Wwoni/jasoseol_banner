@@ -32,13 +32,15 @@ jobs:
           python jasoseol_banner.py
 
       # (옵션 1) 결과물을 아티팩트로 업로드(저장 전용)
-      - name: Upload CSV artifact
+      - name: Upload artifacts (CSV + Debug)
         uses: actions/upload-artifact@v4
         with:
-          name: jasoseol_banner_csv
+          name: jasoseol_banner_outputs
           path: |
             jasoseol_banner.csv
             last_run.txt
+            debug_home.html
+            debug_next_data.json
           if-no-files-found: warn
 
       # (옵션 2) 리포지토리에 커밋(변경 추적/버전관리)
