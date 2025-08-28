@@ -30,10 +30,10 @@ jobs:
       # 서비스계정 JSON을 실제 파일로 저장
       - name: Write service account JSON
         env:
-          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}  # Secrets에 JSON 원문 그대로 저장
+          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}  # Secrets에 JSON 원문 그대로 저장
         run: |
-          printf '%s' "$GDRIVE_SA_JSON" > gdrive_sa.json
-          test -s gdrive_sa.json || (echo "gdrive_sa.json is empty!" && exit 1)
+          printf '%s' "$GDRIVE_CREDENTIALS_JSON" > gdrive_credentials.json
+          test -s gdrive_credentials.json || (echo "gdrive_credentials is empty!" && exit 1)
 
       # (강추) 사전검증: 폴더 조회가 되는지 먼저 확인
       - name: Verify Drive folder access
@@ -58,7 +58,7 @@ jobs:
       - name: Run crawler & upload
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          GDRIVE_SA_JSON_PATH: gdrive_sa.json
+          GDRIVE_SA_JSON_PATH: gdrive_credentials.json
         run: |
           python jasoseol_banner.py
 
