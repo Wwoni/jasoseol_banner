@@ -145,8 +145,7 @@ def collect_from_next_data(soup: BeautifulSoup) -> list[dict]:
                 "Src": img_url,
                 "Srcset_Modified": "",
                 "Source": "__NEXT_DATA__",
-            }
-        )
+            })
 
     return rows
 
@@ -201,7 +200,7 @@ def main():
 
     # === 여기부터 드라이브 업로드 “필수” 호출 ===
     print("[INFO] Google Drive 업로드 시작…")
-    file_id = upload_to_drive(out_csv, "jasoseol_banner.csv")
+    file_id = upload_to_gdrive(out_csv, "jasoseol_banner.csv")
     print(f"[OK] Drive 업로드 완료 fileId={file_id}")
         
     from googleapiclient.discovery import build
