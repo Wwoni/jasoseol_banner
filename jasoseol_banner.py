@@ -251,7 +251,7 @@ def main():
 
     # === 업로드 강제 호출 (로그 반드시 찍기) ===
     print("[INFO] Google Drive 업로드 시작…")
-    file_id = upload_to_drive(out_csv, "jasoseol_banner.csv")  # 예외는 그대로 raise
+    file_id = upload_to_gdrive(out_csv, "jasoseol_banner.csv")  # 예외는 그대로 raise
     print(f"[OK] Drive 업로드 완료 fileId={file_id}")
 
 if __name__ == "__main__":
