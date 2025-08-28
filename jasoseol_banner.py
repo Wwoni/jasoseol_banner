@@ -246,7 +246,7 @@ def main():
     df = pd.DataFrame(rows).drop_duplicates()
 
     out_csv = "jasoseol_banner.csv"
-    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    df.to_csv("jasoseol_banner.csv", index=False, encoding="utf-8-sig", lineterminator="\n")
     print(f"[OK] {len(df)}개 배너 수집 완료 → {out_csv}")
 
     # Google Drive 업로드 호출
