@@ -34,6 +34,7 @@ def looks_like_img(url: str) -> bool:
     return False
 
 def normalize_img_url(url: str) -> str:
+    # /_next/image?url=... → 실제 원본 URL로 변환 시도
     if "/_next/image" in url and "url=" in url:
         try:
             qs = parse_qs(urlparse(url).query)
@@ -45,14 +46,19 @@ def normalize_img_url(url: str) -> str:
     return urljoin(BASE_URL, url)
 
 def url_basename(url: str) -> str:
+    """쿼리 제거 + 디코딩된 파일명만 추출"""
     if not url:
         return ""
     u = unquote(url)
-    path = urlparse(u).path
-    return os.path.basename(path)
+    return os.path.basename(urlparse(u).path)
 
 def parse_srcset_modified(srcset: str) -> str:
-    """Selenium 코드에서 쓰던 규칙을 그대로 재현"""
+    """
+    Selenium 수동 코드 규칙 재현:
+    - ', ' 로 split 후 마지막 항목 제거
+    - 각 항목은 'url width' 중 url만 취함
+    - 상대경로면 'https://jasoseol.com' 접두사
+    """
     if not srcset:
         return ""
     parts = [p.strip() for p in srcset.split(",") if p.strip()]
@@ -67,6 +73,7 @@ def parse_srcset_modified(srcset: str) -> str:
     return ", ".join(urls)
 
 def lcs_len(a: str, b: str) -> int:
+    """간단한 유사도(최장 공통 부분 길이 근사)"""
     short, long = (a, b) if len(a) <= len(b) else (b, a)
     best = 0
     for i in range(len(short)):
@@ -77,21 +84,34 @@ def lcs_len(a: str, b: str) -> int:
     return best
 
 # -------------------------
-# DOM collectors
+# DOM collectors (보이는 배너 우선)
 # -------------------------
 def collect_from_static_dom(soup: BeautifulSoup) -> list[dict]:
     rows = []
-    for node in soup.select(".main-banner-ggs"):
+
+    # 1) 실제로 보이는 배너만 우선
+    candidates = soup.select(".main-banner-ggs.opacity-100")
+    # 2) fallback: 그래도 없으면 전체
+    if not candidates:
+        candidates = soup.select(".main-banner-ggs")
+
+    seen = set()
+    for node in candidates:
         img = node.find("img")
         if not img:
             continue
-        alt = img.get("alt", "")
+        alt = (img.get("alt") or "").strip()
         src = normalize_img_url(img.get("src") or "")
         src = unquote(src)
         srcset_mod = parse_srcset_modified(img.get("srcset") or "")
 
+        key = (src, alt)
+        if key in seen:  # 중복 제거
+            continue
+        seen.add(key)
+
         rows.append({
-            "Link": "",  # Link는 나중에 채움
+            "Link": "",     # 나중에 채움
             "Alt": alt,
             "Src": src,
             "Srcset": srcset_mod,
@@ -99,7 +119,7 @@ def collect_from_static_dom(soup: BeautifulSoup) -> list[dict]:
     return rows
 
 # -------------------------
-# __NEXT_DATA__ collectors
+# __NEXT_DATA__ collectors (img ↔ link 페어)
 # -------------------------
 def deep_iter(v: Any) -> Iterable[Any]:
     if isinstance(v, dict):
@@ -115,12 +135,20 @@ def collect_next_banner_pairs(soup: BeautifulSoup) -> list[dict]:
     tag = soup.find("script", id="__NEXT_DATA__")
     if not tag or not tag.text:
         return []
+    # 디버그 저장(선택)
+    try:
+        with open("debug_next_data.json", "w", encoding="utf-8") as f:
+            f.write(tag.text)
+    except Exception:
+        pass
+
     try:
         data = json.loads(tag.text)
     except Exception:
         return []
 
     pairs = []
+
     def walk(node):
         if isinstance(node, dict):
             flat = []
@@ -146,7 +174,10 @@ def collect_next_banner_pairs(soup: BeautifulSoup) -> list[dict]:
         elif isinstance(node, list):
             for v in node:
                 walk(v)
+
     walk(data)
+
+    # (img basename, link) 기준 중복 제거
     uniq = {}
     for p in pairs:
         key = (url_basename(p["img"]), p["link"])
@@ -154,29 +185,37 @@ def collect_next_banner_pairs(soup: BeautifulSoup) -> list[dict]:
     return list(uniq.values())
 
 # -------------------------
-# Link 매칭
+# Link 매칭 (파일명 동일 → 근사 유사도 → 기본값)
 # -------------------------
 def fill_links_with_next_pairs(rows: list[dict], pairs: list[dict]) -> list[dict]:
     if not rows or not pairs:
+        # 그래도 빈 Link는 보정
+        for r in rows:
+            if not r.get("Link"):
+                r["Link"] = urljoin(BASE_URL, "/desktop")
         return rows
+
     index = {}
     for p in pairs:
         bname = url_basename(p["img"])
         index.setdefault(bname, set()).add(p["link"])
+
+    # 1차: 동일 basename
     for r in rows:
         if r.get("Link"):
             continue
         b = url_basename(r.get("Src", ""))
         if b in index and index[b]:
             r["Link"] = sorted(index[b])[0]
+
+    # 2차: 근사 유사도
     for r in rows:
         if r.get("Link"):
             continue
         b = url_basename(r.get("Src", ""))
         if not b:
             continue
-        best_link = None
-        best_score = 0
+        best_link, best_score = None, 0
         for pbname, links in index.items():
             score = lcs_len(b, pbname)
             if score > best_score:
@@ -184,9 +223,12 @@ def fill_links_with_next_pairs(rows: list[dict], pairs: list[dict]) -> list[dict
                 best_link = sorted(links)[0]
         if best_link and best_score >= max(5, len(b) // 3):
             r["Link"] = best_link
+
+    # 3차: 기본값 보정
     for r in rows:
         if not r.get("Link"):
             r["Link"] = urljoin(BASE_URL, "/desktop")
+
     return rows
 
 # -------------------------
@@ -219,6 +261,7 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
 
     drive = build("drive", "v3", credentials=creds)
 
+    # 동일 파일명 검색 (공유드라이브 대응)
     query = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
     list_kwargs = {
         "q": query,
@@ -233,46 +276,64 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
     files = resp.get("files", [])
     media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
 
-    if files:
-        file_id = files[0]["id"]
-        drive.files().update(
-            fileId=file_id,
-            media_body=media,
-            supportsAllDrives=True,
-        ).execute()
-        return file_id
-    else:
-        metadata = {"name": filename, "parents": [folder_id]}
-        file = drive.files().create(
-            body=metadata,
-            media_body=media,
-            fields="id",
-            supportsAllDrives=True,
-        ).execute()
-        return file["id"]
+    try:
+        if files:
+            file_id = files[0]["id"]
+            drive.files().update(
+                fileId=file_id,
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute()
+            return file_id
+        else:
+            metadata = {"name": filename, "parents": [folder_id]}
+            file = drive.files().create(
+                body=metadata,
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            return file["id"]
+    except HttpError as he:
+        raise RuntimeError(
+            f"업로드 실패: {he}. "
+            "서비스계정 권한(공유드라이브 구성원)과 GDRIVE_FOLDER_ID가 공유드라이브 폴더인지 확인하세요."
+        )
 
 # -------------------------
 # main
 # -------------------------
 def main():
     html = fetch_html(BASE_URL)
+
+    # (선택) 디버그: 원문 저장
+    try:
+        with open("debug_home.html", "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception:
+        pass
+
     soup = BeautifulSoup(html, "lxml")
 
+    # 1) DOM에서 배너(보이는 것 우선) 수집
     rows = collect_from_static_dom(soup)
+
+    # 2) __NEXT_DATA__에서 (img, link) 페어 수집 후 Link 채움
     pairs = collect_next_banner_pairs(soup)
     rows = fill_links_with_next_pairs(rows, pairs)
 
-    cleaned = [
-        r for r in rows if any([r.get("Link"), r.get("Alt"), r.get("Srcset")])
-    ]
+    # 3) 정제 및 저장 (컬럼 보장)
+    cleaned = [r for r in rows if any([r.get("Link"), r.get("Alt"), r.get("Srcset")])]
     df = pd.DataFrame(cleaned).drop_duplicates()
+    df = df.rename(columns={"Srcset_Modified": "Srcset"})  # 혹시라도 이름이 다를 때 통일
+    expected_cols = ["Link", "Alt", "Srcset"]
+    df = df.reindex(columns=expected_cols, fill_value="")
 
     out_csv = "jasoseol_banner.csv"
-    df = df[["Link", "Alt", "Srcset"]]  # CSV 컬럼 통일
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
-
     print(f"[OK] {len(df)}개 배너 수집 완료 → {out_csv}")
 
+    # 4) 구글 드라이브 업로드
     print("[INFO] Google Drive 업로드 시작…")
     file_id = upload_to_gdrive(out_csv, "jasoseol_banner.csv")
     print(f"[OK] Drive 업로드 완료 fileId={file_id}")
