@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import requests
@@ -195,18 +196,17 @@ def main():
     df = pd.DataFrame(cleaned).drop_duplicates()
 
     out_csv = "jasoseol_banner.csv"
-    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
-
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig", lineterminator="\n")
     print(f"[OK] {len(df)}개 배너 수집 완료 → {out_csv}")
 
-    # 실행 로그 및 디버그 타임스탬프
-    with open("last_run.txt", "w", encoding="utf-8") as f:
-        f.write(datetime.now().isoformat())
+    # === 여기부터 드라이브 업로드 “필수” 호출 ===
+    print("[INFO] Google Drive 업로드 시작…")
+    file_id = upload_to_drive(out_csv, "jasoseol_banner.csv")
+    print(f"[OK] Drive 업로드 완료 fileId={file_id}")
         
     from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from google.oauth2 import service_account
-import os
+    from googleapiclient.http import MediaFileUpload
+    from google.oauth2 import service_account
 
 def upload_to_gdrive(file_path: str, drive_id: str, folder_id: str | None = None):
     # Secret에 저장한 JSON 키 불러오기
