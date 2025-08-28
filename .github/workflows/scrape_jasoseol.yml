@@ -87,6 +87,3 @@ jobs:
           sed -n '1,200p' jasoseol_banner.py
           echo "grep upload_to_drive:"; grep -n "upload_to_drive" jasoseol_banner.py || true
           echo "grep Drive 업로드 로그:"; grep -n "Drive 업로드" jasoseol_banner.py || true
-            debug_home.html
-            debug_next_data.json
-          if-no-files-found: warn
