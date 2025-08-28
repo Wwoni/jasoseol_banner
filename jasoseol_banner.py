@@ -210,9 +210,9 @@ def main():
 
 def upload_to_gdrive(file_path: str, drive_id: str, folder_id: str | None = None):
     # Secret에 저장한 JSON 키 불러오기
-    creds_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    creds_json = os.environ.get("GDRIVE_CREDENTIALS_JSON")
     if not creds_json:
-        raise RuntimeError("환경변수 GCP_SERVICE_ACCOUNT_JSON 이 없습니다.")
+        raise RuntimeError("환경변수 GDRIVE_CREDENTIALS_JSON 이 없습니다.")
     
     creds_dict = json.loads(creds_json)
     creds = service_account.Credentials.from_service_account_info(
