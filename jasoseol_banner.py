@@ -246,14 +246,13 @@ def main():
     df = pd.DataFrame(rows).drop_duplicates()
 
     out_csv = "jasoseol_banner.csv"
-    df.to_csv("jasoseol_banner.csv", index=False, encoding="utf-8-sig", lineterminator="\n")
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig", lineterminator="\n")
     print(f"[OK] {len(df)}개 배너 수집 완료 → {out_csv}")
 
-    # Google Drive 업로드 호출
-    drive_id = os.environ.get("GDRIVE_ID")       # 공유드라이브 ID
-    folder_id = os.environ.get("GDRIVE_FOLDER")  # 업로드할 폴더 ID (없으면 공유드라이브 루트)
-    if drive_id:
-        upload_to_gdrive(out_csv, drive_id, folder_id)
+    # === 업로드 강제 호출 (로그 반드시 찍기) ===
+    print("[INFO] Google Drive 업로드 시작…")
+    file_id = upload_to_drive(out_csv, "jasoseol_banner.csv")  # 예외는 그대로 raise
+    print(f"[OK] Drive 업로드 완료 fileId={file_id}")
 
 if __name__ == "__main__":
     main()
