@@ -1,270 +1,314 @@
 # jasoseol_banner.py
-import os, json, time
+import os
+import re
+import json
+import requests
 import pandas as pd
-from pathlib import Path
-from urllib.parse import urljoin, urlparse, unquote
-from typing import List, Dict, Optional, Any
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
-# Google Drive
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from googleapiclient.errors import HttpError
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, unquote, parse_qs
+from typing import Any, Iterable
 
 BASE_URL = "https://jasoseol.com/"
-OUTPUT_CSV = "jasoseol_banner.csv"
-DEBUG_DIR = Path("debug")
-DEBUG_DIR.mkdir(exist_ok=True)
 
-# =========================
-# Small utils
-# =========================
-def url_basename(url: str) -> str:
-    if not url:
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+IMG_EXT_RE = re.compile(r"\.(?:png|jpg|jpeg|webp|gif)(?:\?.*)?$", re.IGNORECASE)
+
+# -------------------------
+# HTTP / Parsing helpers
+# -------------------------
+def fetch_html(url: str) -> str:
+    resp = requests.get(url, headers={"User-Agent": UA}, timeout=20)
+    resp.raise_for_status()
+    return resp.text
+
+def safe_urljoin(base: str, maybe_url: str | None) -> str:
+    if not maybe_url:
         return ""
-    return os.path.basename(urlparse(unquote(url)).path)
+    return urljoin(base, maybe_url)
 
 def looks_like_img(url: str) -> bool:
     if not url:
         return False
-    u = url.lower()
-    return any(ext in u for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")) or ("/_next/image" in u and "url=" in u)
+    if IMG_EXT_RE.search(url):
+        return True
+    if "/_next/image" in url and "url=" in url:
+        return True
+    return False
 
-# =========================
-# __NEXT_DATA__ 보조 페어 추출(보수적)
-#   - 같은 오브젝트 안에 이미지/링크가 함께 있을 때만 페어링
-# =========================
-def collect_next_pairs(page) -> List[Dict[str, str]]:
-    pairs: List[Dict[str, str]] = []
-    tag = page.query_selector("script#__NEXT_DATA__")
-    if not tag:
-        return pairs
-    try:
-        data = json.loads(tag.inner_text())
-    except Exception:
-        return pairs
+def normalize_img_url(url: str) -> str:
+    # /_next/image?url=... → 실제 원본 URL로 변환 시도
+    if "/_next/image" in url and "url=" in url:
+        try:
+            qs = parse_qs(urlparse(url).query)
+            raw = qs.get("url", [""])[0]
+            if raw:
+                return safe_urljoin(BASE_URL, raw)
+        except Exception:
+            pass
+    return safe_urljoin(BASE_URL, url)
 
-    def walk(node: Any):
-        if isinstance(node, dict):
-            flat = []
-            for v in node.values():
-                if isinstance(v, (dict, list)):
-                    walk(v)
-                else:
-                    flat.append(v)
+def strip_query_and_unquote(u: str) -> str:
+    if not u:
+        return ""
+    u = unquote(u)
+    parsed = urlparse(u)
+    return parsed._replace(query="", fragment="").geturl()
 
-            imgs, links = [], []
-            for s in flat:
-                if not isinstance(s, str):
-                    continue
-                if looks_like_img(s):
-                    imgs.append(s)
-                elif (s.startswith("/") or s.startswith("http")) and not looks_like_img(s):
-                    links.append(s)
+def url_basename(u: str) -> str:
+    if not u:
+        return ""
+    u = strip_query_and_unquote(u)
+    return os.path.basename(urlparse(u).path)
 
-            if imgs and links:
-                link0 = links[0]
-                link_abs = urljoin(BASE_URL, link0) if link0.startswith("/") else link0
-                for si in imgs:
-                    pairs.append({"img": si, "link": link_abs})
+# -------------------------
+# DOM collectors (배너 IMG만 수집)
+# -------------------------
+def collect_from_dom(soup: BeautifulSoup) -> list[dict]:
+    rows = []
+    # 배너 컨테이너
+    candidates = soup.select(".main-banner-ggs")
+    if not candidates:
+        # 백업 셀렉터
+        candidates = soup.select(".swiper .swiper-slide, .banner, .main-banner, .main_banner")
 
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
+    for node in candidates:
+        img = node.find("img")
+        if not img:
+            continue
+        alt = img.get("alt") or ""
+        src = normalize_img_url(img.get("src") or "")
+        if not looks_like_img(src):
+            continue
+        rows.append(
+            {
+                "Title": alt,
+                "Src": strip_query_and_unquote(src),  # 비교 용이하게 정규화
+                "Link": "",  # 나중에 NEXT_DATA로 채움
+                "Source": "DOM",
+            }
+        )
+    # 중복 제거(이미지 기준)
+    uniq = {}
+    for r in rows:
+        uniq[r["Src"]] = r
+    return list(uniq.values())
 
-    walk(data)
+# -------------------------
+# __NEXT_DATA__ → (image_url, link_url) 페어만 뽑기
+# -------------------------
+def iter_nodes(v: Any):
+    if isinstance(v, dict):
+        yield v
+        for vv in v.values():
+            yield from iter_nodes(vv)
+    elif isinstance(v, list):
+        for vv in v:
+            yield from iter_nodes(vv)
 
-    # 유니크(이미지 파일명 + 링크)
-    seen = set()
-    uniq = []
+def extract_pairs_from_next(next_json: dict) -> list[dict]:
+    """
+    __NEXT_DATA__ 전체를 훑어서
+      - image_url (이미지 주소)
+      - link_url  (클릭시 이동 주소)
+    가 같은 dict에 공존하는 경우만 추출.
+    """
+    pairs = []
+    for node in iter_nodes(next_json):
+        if not isinstance(node, dict):
+            continue
+        img = node.get("image_url")
+        link = node.get("link_url")
+        if img and link and isinstance(img, str) and isinstance(link, str):
+            if looks_like_img(img):
+                pairs.append({"img": strip_query_and_unquote(img), "link": link})
+    # 중복 제거
+    uniq = {}
     for p in pairs:
         key = (url_basename(p["img"]), p["link"])
-        if key not in seen:
-            seen.add(key)
-            uniq.append(p)
-    # 디버그 덤프
-    (DEBUG_DIR / "next_pairs.json").write_text(json.dumps(uniq, ensure_ascii=False, indent=2), encoding="utf-8")
-    return uniq
+        uniq[key] = p
+    return list(uniq.values())
 
-# =========================
-# 디버그 훅: 콘솔/네트워크 요청/응답 기록
-# =========================
-def attach_debug_listeners(page, capture_list: List[Dict]):
-    page.on("console", lambda msg: capture_list.append(
-        {"type": "console", "text": msg.text(), "level": msg.type()}))
-    page.on("request", lambda req: capture_list.append(
-        {"type": "request", "url": req.url, "method": req.method, "resource": req.resource_type}))
-    page.on("response", lambda res: capture_list.append(
-        {"type": "response", "url": res.url, "status": res.status}))
-
-# =========================
-# 클릭 & 캡처: 해당 이미지가 포함된 배너 컨테이너를 클릭해 랜딩 URL 획득
-# =========================
-def click_and_capture(page, container, img, idx: int) -> Optional[str]:
-    # 클릭 전 DOM 저장
-    (DEBUG_DIR / f"before_{idx}.html").write_text(page.content(), encoding="utf-8")
-
-    logs: List[Dict] = []
-    attach_debug_listeners(page, logs)
-
-    origin_url = page.url
-    real_url: Optional[str] = None
-
-    # 자동 회전 간섭 완화
+def collect_next_pairs(soup: BeautifulSoup) -> list[dict]:
+    tag = soup.find("script", id="__NEXT_DATA__")
+    if not tag or not tag.text:
+        return []
     try:
-        img.scroll_into_view_if_needed(timeout=2000)
-        container.hover(timeout=2000)
-    except PWTimeout:
+        data = json.loads(tag.text)
+    except Exception:
+        return []
+    pairs = extract_pairs_from_next(data)
+    # 디버깅 저장
+    try:
+        os.makedirs("debug", exist_ok=True)
+        with open("debug/next_pairs.jsonl", "w", encoding="utf-8") as f:
+            for p in pairs:
+                f.write(json.dumps(p, ensure_ascii=False) + "\n")
+    except Exception:
         pass
+    return pairs
 
-    # 1) 팝업 시도
-    try:
-        with page.expect_event("popup", timeout=3000) as pop_waiter:
-            container.click(force=True, timeout=2500)
-        new_page = pop_waiter.value
-        try:
-            new_page.wait_for_load_state("domcontentloaded", timeout=6000)
-        except PWTimeout:
-            pass
-        real_url = new_page.url
-        # 팝업 페이지 URL도 기록
-        with (DEBUG_DIR / f"popup_{idx}.txt").open("w", encoding="utf-8") as f:
-            f.write(real_url or "")
-        new_page.close()
-    except PWTimeout:
-        # 2) 동일 탭 라우팅
-        try:
-            container.click(force=True, timeout=2500)
-        except PWTimeout:
-            pass
-        # URL 변경 또는 네트워크 안정 대기
-        changed = False
-        for _ in range(4):
-            try:
-                page.wait_for_load_state("networkidle", timeout=2000)
-            except PWTimeout:
-                pass
-            if page.url != origin_url:
-                changed = True
-                break
-            time.sleep(0.2)
+# -------------------------
+# Link 매칭 (Src ↔ image_url)
+# -------------------------
+def fill_links(rows: list[dict], pairs: list[dict]) -> list[dict]:
+    if not rows or not pairs:
+        return rows
 
-        if changed:
-            real_url = page.url
-            # 원래 페이지로 복귀
-            try:
-                page.go_back(wait_until="networkidle", timeout=6000)
-            except PWTimeout:
-                page.goto(BASE_URL, wait_until="networkidle", timeout=15000)
-                page.wait_for_selector(".main-banner-ggs img", timeout=15000)
+    # 이미지 basename -> link 후보
+    idx: dict[str, set[str]] = {}
+    for p in pairs:
+        b = url_basename(p["img"])
+        if not b:
+            continue
+        idx.setdefault(b, set()).add(p["link"])
 
-    # 클릭 후 DOM 저장 + 로그 저장
-    (DEBUG_DIR / f"after_{idx}.html").write_text(page.content(), encoding="utf-8")
-    with (DEBUG_DIR / f"requests_{idx}.jsonl").open("w", encoding="utf-8") as f:
-        for row in logs:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    return real_url
-
-# =========================
-# 메인 스크레이퍼
-# =========================
-def scrape_all() -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        # CSR 완성까지 대기
-        page.goto(BASE_URL, timeout=45000, wait_until="networkidle")
-        page.wait_for_selector(".main-banner-ggs img", timeout=20000)
-
-        # __NEXT_DATA__ 보조 인덱스
-        next_pairs = collect_next_pairs(page)
-        pair_by_name: Dict[str, set] = {}
-        for pr in next_pairs:
-            pair_by_name.setdefault(url_basename(pr["img"]), set()).add(pr["link"])
-
-        # 전체 배너 이미지 목록
-        img_loc = page.locator(".main-banner-ggs img")
-        count = img_loc.count()
-
-        for i in range(count):
-            img = img_loc.nth(i)
-            container = page.locator(".main-banner-ggs").filter(has=img)
-
-            alt = img.get_attribute("alt") or ""
-            src = img.get_attribute("src") or ""
-            if src and not src.startswith("http"):
-                src = urljoin(BASE_URL, src)
-
-            link_final: Optional[str] = click_and_capture(page, container, img, i)
-
-            # 클릭으로 못 얻으면 __NEXT_DATA__로 보완(같은 파일명일 때만)
-            if not link_final:
-                bname = url_basename(src)
-                if bname in pair_by_name and pair_by_name[bname]:
-                    link_final = sorted(pair_by_name[bname])[0]
-
-            # 그래도 없으면 빈 값(가짜 링크 금지)
-            rows.append({"Alt": alt, "Src": src, "Link": link_final or ""})
-
-        browser.close()
+    for r in rows:
+        if r.get("Link"):
+            continue
+        b = url_basename(r.get("Src", ""))
+        cand = sorted(idx.get(b, []))
+        if cand:
+            r["Link"] = cand[0]  # 동일 파일명은 보통 1:1
     return rows
 
-# =========================
+# -------------------------
 # Google Drive 업로드
-# =========================
+# -------------------------
 def upload_to_gdrive(local_path: str, filename: str) -> str:
+    """
+    CSV를 구글 '공유드라이브' 폴더에 업로드(동일 파일명 있으면 update, 없으면 create).
+    환경변수:
+      - GDRIVE_FOLDER_ID (필수)
+      - GDRIVE_CREDENTIALS_JSON (필수)  # 서비스계정 JSON 원문 (권장)
+        또는 GDRIVE_SA_JSON_PATH (선택)  # gdrive_sa.json 파일 경로
+      - GDRIVE_DRIVE_ID (선택)          # 공유드라이브 ID
+    """
+    import json as _json
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    from googleapiclient.errors import HttpError
+
     folder_id = os.environ.get("GDRIVE_FOLDER_ID")
+    drive_id = os.environ.get("GDRIVE_DRIVE_ID")  # optional
     raw_json = os.environ.get("GDRIVE_CREDENTIALS_JSON")
-    sa_path = os.environ.get("GDRIVE_SA_JSON_PATH", "gdrive_sa.json")
+    sa_path = os.environ.get("GDRIVE_SA_JSON_PATH")  # optional
+
     if not folder_id:
         raise RuntimeError("GDRIVE_FOLDER_ID가 설정되지 않았습니다.")
 
     scopes = ["https://www.googleapis.com/auth/drive"]
-    creds = (service_account.Credentials.from_service_account_info(json.loads(raw_json), scopes=scopes)
-             if raw_json else
-             service_account.Credentials.from_service_account_file(sa_path, scopes=scopes))
+
+    creds = None
+    if raw_json:
+        try:
+            info = _json.loads(raw_json)
+            creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        except Exception as e:
+            raise RuntimeError(f"GDRIVE_CREDENTIALS_JSON 파싱 실패: {e}")
+
+    if creds is None:
+        if not sa_path:
+            sa_path = "gdrive_sa.json"
+        if not os.path.exists(sa_path):
+            raise FileNotFoundError(f"서비스계정 파일을 찾을 수 없습니다: {sa_path}")
+        creds = service_account.Credentials.from_service_account_file(sa_path, scopes=scopes)
+
     drive = build("drive", "v3", credentials=creds)
 
-    q = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
     try:
-        resp = drive.files().list(
-            q=q,
-            fields="files(id,name)",
+        folder_meta = drive.files().get(
+            fileId=folder_id,
+            fields="id,name,driveId,mimeType",
             supportsAllDrives=True,
-            includeItemsFromAllDrives=True
         ).execute()
+        if folder_meta.get("mimeType") != "application/vnd.google-apps.folder":
+            raise RuntimeError(f"GDRIVE_FOLDER_ID가 폴더가 아닙니다: {folder_meta.get('mimeType')}")
     except HttpError as he:
-        raise RuntimeError(f"폴더/리스트 조회 실패: {he}")
+        raise RuntimeError(
+            f"폴더 조회 실패: {he}. "
+            "공유드라이브 폴더 ID가 맞는지, 서비스계정이 해당 드라이브의 구성원인지 확인하세요."
+        )
 
+    query = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
+    list_kwargs = {
+        "q": query,
+        "fields": "files(id,name)",
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+    }
+    if drive_id:
+        list_kwargs.update({"driveId": drive_id, "corpora": "drive"})
+
+    resp = drive.files().list(**list_kwargs).execute()
     files = resp.get("files", [])
     media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
 
-    if files:
-        fid = files[0]["id"]
-        drive.files().update(fileId=fid, media_body=media, supportsAllDrives=True).execute()
-        return fid
-    else:
-        meta = {"name": filename, "parents": [folder_id]}
-        file = drive.files().create(
-            body=meta, media_body=media, fields="id", supportsAllDrives=True
-        ).execute()
-        return file["id"]
+    try:
+        if files:
+            file_id = files[0]["id"]
+            drive.files().update(
+                fileId=file_id,
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute()
+            return file_id
+        else:
+            metadata = {"name": filename, "parents": [folder_id]}
+            file = drive.files().create(
+                body=metadata,
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            return file["id"]
+    except HttpError as he:
+        raise RuntimeError(
+            f"업로드 실패: {he}. "
+            "서비스계정 권한(공유드라이브 구성원)과 GDRIVE_FOLDER_ID가 공유드라이브 폴더인지 확인하세요."
+        )
 
-# =========================
+# -------------------------
 # main
-# =========================
+# -------------------------
 def main():
-    rows = scrape_all()
-    df = pd.DataFrame(rows).drop_duplicates()
-    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig", lineterminator="\n")
-    print(f"[OK] {len(df)}개 배너 수집 완료 → {OUTPUT_CSV}")
+    html = fetch_html(BASE_URL)
 
+    # 디버그: 원문 저장
+    try:
+        os.makedirs("debug", exist_ok=True)
+        with open("debug/home.html", "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception:
+        pass
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # 1) DOM에서 배너 IMG 수집
+    rows = collect_from_dom(soup)
+
+    # 2) __NEXT_DATA__에서 (image_url, link_url)만 추출해서 1:1 매칭
+    pairs = collect_next_pairs(soup)
+    rows = fill_links(rows, pairs)
+
+    # 3) CSV 저장 (Title/Alt 통일)
+    for r in rows:
+        r["Alt"] = r.pop("Title", "")
+
+    df = pd.DataFrame(rows, columns=["Link", "Alt", "Src"])
+    out_csv = "jasoseol_banner.csv"
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig", lineterminator="\n")
+    print(f"[OK] {len(df)}개 배너 수집 완료 → {out_csv}")
+
+    # 4) 구글 드라이브 업로드
     print("[INFO] Google Drive 업로드 시작…")
-    fid = upload_to_gdrive(OUTPUT_CSV, "jasoseol_banner.csv")
-    print(f"[OK] Drive 업로드 완료 fileId={fid}")
+    file_id = upload_to_gdrive(out_csv, "jasoseol_banner.csv")
+    print(f"[OK] Drive 업로드 완료 fileId={file_id}")
 
 if __name__ == "__main__":
     main()
