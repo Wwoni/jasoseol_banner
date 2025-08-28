@@ -24,25 +24,40 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      # (1) 서비스계정 JSON 파일 생성
+           python -m pip install --upgrade pip
+           pip install -r requirements.txt      
+      
+      # 서비스계정 JSON을 실제 파일로 저장
       - name: Write service account JSON
-        shell: bash
         env:
-          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}  # <-- 리포 Secrets에 저장한 JSON 원문
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}  # Secrets에 JSON 원문 그대로 저장
         run: |
           printf '%s' "$GDRIVE_SA_JSON" > gdrive_sa.json
+          test -s gdrive_sa.json || (echo "gdrive_sa.json is empty!" && exit 1)
 
-      # (2) 크롤링 + 드라이브 업로드 실행
+      # (강추) 사전검증: 폴더 조회가 되는지 먼저 확인
+      - name: Verify Drive folder access
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          python - <<'PY'
+          import os
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          creds = service_account.Credentials.from_service_account_file(
+              "gdrive_sa.json", scopes=["https://www.googleapis.com/auth/drive"]
+          )
+          svc = build("drive","v3",credentials=creds)
+          meta = svc.files().get(fileId=os.environ["GDRIVE_FOLDER_ID"],
+                           fields="id,name,driveId,mimeType",
+                           supportsAllDrives=True).execute()
+          print("Folder OK:", meta)
+          PY
+      
+      # 크롤링 + 업로드 실행
       - name: Run crawler & upload
         env:
-          # 필수: 공유드라이브 내 '대상 폴더 ID'
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          # 선택: 공유드라이브 ID(검색 최적화)
-          GDRIVE_DRIVE_ID: ${{ secrets.GDRIVE_DRIVE_ID }}
-          # 선택: 서비스계정 JSON 경로(기본 gdrive_sa.json)
           GDRIVE_SA_JSON_PATH: gdrive_sa.json
         run: |
           python jasoseol_banner.py
