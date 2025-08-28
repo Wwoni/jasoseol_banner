@@ -47,11 +47,13 @@ jobs:
       - name: Verify Drive folder access
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
           python - <<'PY'
           import os, json
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
+          raw = os.environ["GDRIVE_CREDENTIALS_JSON"]
           creds = service_account.Credentials.from_service_account_file(
               "gdrive_sa.json", scopes=["https://www.googleapis.com/auth/drive"]
           )
@@ -66,7 +68,7 @@ jobs:
       - name: Run crawler & upload
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          GDRIVE_SA_JSON_PATH: gdrive_sa.json   # ← 파이썬이 이 경로를 읽도록
+          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}   # ← 파이썬이 이 경로를 읽도록
         run: |
           python jasoseol_banner.py
 
@@ -78,6 +80,13 @@ jobs:
           path: |
             jasoseol_banner.csv
             last_run.txt
+
+      # (옵션) 실행 파일에 업로드 코드가 있는지 바로 로그로 확인
+      - name: Show script head (sanity)
+        run: |
+          sed -n '1,200p' jasoseol_banner.py
+          echo "grep upload_to_drive:"; grep -n "upload_to_drive" jasoseol_banner.py || true
+          echo "grep Drive 업로드 로그:"; grep -n "Drive 업로드" jasoseol_banner.py || true
             debug_home.html
             debug_next_data.json
           if-no-files-found: warn
