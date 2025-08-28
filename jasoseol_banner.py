@@ -4,7 +4,7 @@ import json
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote, parse_qs
 from datetime import datetime
 from typing import Any, Iterable
 
@@ -18,6 +18,9 @@ UA = (
 
 IMG_EXT_RE = re.compile(r"\.(?:png|jpg|jpeg|webp|gif)(?:\?.*)?$", re.IGNORECASE)
 
+# -------------------------
+# HTTP / Parsing helpers
+# -------------------------
 def fetch_html(url: str) -> str:
     resp = requests.get(url, headers={"User-Agent": UA}, timeout=20)
     resp.raise_for_status()
@@ -32,72 +35,27 @@ def parse_srcset(srcset: str, base: str) -> list[str]:
     if not srcset:
         return []
     parts = [p.strip() for p in srcset.split(",") if p.strip()]
-    # 원 요청 로직: 마지막 항목 제외
     if len(parts) > 1:
-        parts = parts[:-1]
+        parts = parts[:-1]  # 원 요청 로직: 마지막 항목 제외
     urls = []
     for p in parts:
         url_only = p.split()[0]
         urls.append(safe_urljoin(base, url_only))
     return urls
 
-def collect_from_static_dom(soup: BeautifulSoup) -> list[dict]:
-    rows = []
-
-    # 1) 원래 셀렉터
-    candidates = soup.select(".main-banner-ggs")
-
-    # 2) 흔한 배너 패턴(예: swiper/picture/img)
-    if not candidates:
-        candidates = soup.select(
-            ".swiper .swiper-slide, .banner, .main-banner, .main_banner"
-        )
-
-    for node in candidates:
-        a = node.find("a")
-        img = node.find("img")
-        link = safe_urljoin(BASE_URL, a.get("href") if a else "")
-        alt = img.get("alt") if img else ""
-        src = safe_urljoin(BASE_URL, img.get("src") if img else "")
-        srcset = img.get("srcset") if img else ""
-        srcset_urls = parse_srcset(srcset, BASE_URL)
-        rows.append(
-            {
-                "Link": link,
-                "Alt": alt or "",
-                "Src": src,
-                "Srcset_Modified": ", ".join(srcset_urls),
-                "Source": "static_dom",
-            }
-        )
-    return rows
-
-def deep_iter(v: Any) -> Iterable[str]:
-    """JSON 등 임의의 중첩 구조에서 문자열만 뽑아냄."""
-    if isinstance(v, dict):
-        for k, vv in v.items():
-            yield from deep_iter(vv)
-    elif isinstance(v, list):
-        for vv in v:
-            yield from deep_iter(vv)
-    elif isinstance(v, str):
-        yield v
-
 def looks_like_img(url: str) -> bool:
     if not url:
         return False
     if IMG_EXT_RE.search(url):
         return True
-    # Next.js 이미지는 /_next/image?url=... 형태일 수 있음 → 원본 URL 추출
     if "/_next/image" in url and "url=" in url:
         return True
     return False
 
 def normalize_img_url(url: str) -> str:
-    # /_next/image?url=encoded&... → 실제 원본 URL로 교체 시도
+    # /_next/image?url=... → 실제 원본 URL로 변환 시도
     if "/_next/image" in url and "url=" in url:
         try:
-            from urllib.parse import parse_qs
             qs = parse_qs(urlparse(url).query)
             raw = qs.get("url", [""])[0]
             if raw:
@@ -106,107 +64,186 @@ def normalize_img_url(url: str) -> str:
             pass
     return safe_urljoin(BASE_URL, url)
 
-def collect_from_next_data(soup: BeautifulSoup) -> list[dict]:
+def url_basename(url: str) -> str:
+    """쿼리/파라미터 제거, 퍼센트 디코딩해서 파일명만 추출"""
+    if not url:
+        return ""
+    u = unquote(url)  # 사람이 읽기 쉬운 형태
+    path = urlparse(u).path
+    return os.path.basename(path)
+
+def lcs_len(a: str, b: str) -> int:
+    """아주 가벼운 매칭 점수: 공통 부분 문자열 길이(간이). 파일명 유사도 판단에 사용."""
+    # 완전한 LCS 대신 간단히 교집합 substr 길이를 추정
+    # (파일명이 길어 유사도 판단은 충분)
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    best = 0
+    for i in range(len(short)):
+        for j in range(i + 1, len(short) + 1):
+            seg = short[i:j]
+            if seg and seg in long:
+                best = max(best, j - i)
+    return best
+
+# -------------------------
+# DOM collectors
+# -------------------------
+def collect_from_static_dom(soup: BeautifulSoup) -> list[dict]:
     rows = []
-    tag = soup.find("script", id="__NEXT_DATA__")
-    if not tag or not tag.text:
-        return rows
+    candidates = soup.select(".main-banner-ggs")
+    if not candidates:
+        candidates = soup.select(".swiper .swiper-slide, .banner, .main-banner, .main_banner")
 
-    # 디버깅용 저장
-    with open("debug_next_data.json", "w", encoding="utf-8") as f:
-        f.write(tag.text)
-
-    try:
-        data = json.loads(tag.text)
-    except Exception:
-        return rows
-
-    # 모든 문자열 중 이미지 URL 후보 수집
-    images = []
-    links = []
-    for s in deep_iter(data):
-        if looks_like_img(s):
-            images.append(normalize_img_url(s))
-        # a태그 href 대신 라우팅 path만 있는 경우 대비
-        # (ex) "/events/123" 같은 path
-        elif isinstance(s, str) and s.startswith("/"):
-            links.append(safe_urljoin(BASE_URL, s))
-
-    # 중복 제거
-    images = list(dict.fromkeys(images))
-    links = list(dict.fromkeys(links))
-
-    # 이미지/링크 매칭은 정확치 않으므로, 우선 이미지 기준 행 생성
-    for img_url in images:
-        rows.append(
-            {
-                "Link": links[0] if links else "",
-                "Alt": "",
-                "Src": img_url,
-                "Srcset_Modified": "",
-                "Source": "__NEXT_DATA__",
-            })
-
-    return rows
-
-def collect_fallback_imgs(soup: BeautifulSoup) -> list[dict]:
-    """정말 아무것도 못 찾았을 때, 페이지 내의 모든 <img>를 수집(보수적)."""
-    rows = []
-    imgs = soup.find_all("img")
-    for img in imgs:
-        src = normalize_img_url(img.get("src") or "")
-        if not src or not looks_like_img(src):
+    for node in candidates:
+        img = node.find("img")
+        if not img:
             continue
         alt = img.get("alt") or ""
-        srcset_urls = parse_srcset(img.get("srcset") or "", BASE_URL)
+        src = normalize_img_url(img.get("src") or "")
+        src = unquote(src)  # 가독성
+        srcset = img.get("srcset") or ""
+        srcset_urls = parse_srcset(srcset, BASE_URL)
         rows.append(
             {
-                "Link": "",
+                "Link": "",  # 나중에 NEXT_DATA 매칭으로 채움
                 "Alt": alt,
                 "Src": src,
                 "Srcset_Modified": ", ".join(srcset_urls),
-                "Source": "fallback_img",
+                "Source": "static_dom",
             }
         )
     return rows
 
-def main():
-    html = fetch_html(BASE_URL)
+# -------------------------
+# __NEXT_DATA__ collectors
+# -------------------------
+def deep_iter(v: Any) -> Iterable[Any]:
+    """임의의 중첩 구조에서 모든 원소 순회"""
+    if isinstance(v, dict):
+        for k, vv in v.items():
+            yield from deep_iter(vv)
+    elif isinstance(v, list):
+        for vv in v:
+            yield from deep_iter(vv)
+    else:
+        yield v
 
-    # 디버그: 원문 저장
-    with open("debug_home.html", "w", encoding="utf-8") as f:
-        f.write(html)
+def collect_next_banner_pairs(soup: BeautifulSoup) -> list[dict]:
+    """
+    __NEXT_DATA__에서 '이미지 URL'과 '링크 경로(/로 시작, 이미지 아님)'가
+    같은 객체/인접 범위에 함께 존재하는 경우를 찾아 pair로 반환.
+    """
+    tag = soup.find("script", id="__NEXT_DATA__")
+    if not tag or not tag.text:
+        return []
 
-    soup = BeautifulSoup(html, "lxml")
+    # 디버깅 보관
+    try:
+        with open("debug_next_data.json", "w", encoding="utf-8") as f:
+            f.write(tag.text)
+    except Exception:
+        pass
 
-    rows = []
-    rows += collect_from_static_dom(soup)
-    if not rows:
-        rows += collect_from_next_data(soup)
-    if not rows:
-        rows += collect_fallback_imgs(soup)
+    try:
+        data = json.loads(tag.text)
+    except Exception:
+        return []
 
-    # 정제: 완전 빈 행 제거
-    cleaned = [
-        r for r in rows
-        if any([r.get("Link"), r.get("Src"), r.get("Srcset_Modified")])
-    ]
+    pairs = []
 
-    df = pd.DataFrame(cleaned).drop_duplicates()
+    def walk(node):
+        # dict인 경우: 같은 오브젝트 안에서 이미지/링크가 함께 있나 확인
+        if isinstance(node, dict):
+            strings = []
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+                else:
+                    strings.append(v)
 
-    out_csv = "jasoseol_banner.csv"
-    df.to_csv(out_csv, index=False, encoding="utf-8-sig", lineterminator="\n")
-    print(f"[OK] {len(df)}개 배너 수집 완료 → {out_csv}")
+            imgs = []
+            links = []
+            for s in strings:
+                if not isinstance(s, str):
+                    continue
+                if looks_like_img(s):
+                    imgs.append(normalize_img_url(s))
+                elif s.startswith("/") and not looks_like_img(s):
+                    links.append(s)
 
-    # === 여기부터 드라이브 업로드 “필수” 호출 ===
-    print("[INFO] Google Drive 업로드 시작…")
-    file_id = upload_to_gdrive(out_csv, "jasoseol_banner.csv")
-    print(f"[OK] Drive 업로드 완료 fileId={file_id}")
-        
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaFileUpload
-    from google.oauth2 import service_account
+            if imgs and links:
+                for si in imgs:
+                    pairs.append(
+                        {
+                            "img": unquote(si),
+                            "link": urljoin(BASE_URL, links[0]),  # 대표 1개
+                        }
+                    )
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
 
+    walk(data)
+    # 중복 제거
+    uniq = {}
+    for p in pairs:
+        key = (url_basename(p["img"]), p["link"])
+        uniq[key] = p
+    return list(uniq.values())
+
+# -------------------------
+# Link 매칭 로직
+# -------------------------
+def fill_links_with_next_pairs(rows: list[dict], pairs: list[dict]) -> list[dict]:
+    """
+    DOM에서 수집한 rows(Src/Alt 포함)에 대해,
+    NEXT_DATA에서 추출한 (img, link) 페어를 파일명 유사도 기준으로 매칭해 Link를 채움.
+    """
+    if not rows or not pairs:
+        return rows
+
+    # 준비: pairs를 이미지 basename -> 후보 링크 리스트로 인덱싱
+    index = {}
+    for p in pairs:
+        bname = url_basename(p["img"])
+        index.setdefault(bname, set()).add(p["link"])
+
+    # 1차: 동일 basename 매칭
+    for r in rows:
+        if r.get("Link"):
+            continue
+        b = url_basename(r.get("Src", ""))
+        if b in index and index[b]:
+            r["Link"] = sorted(index[b])[0]
+
+    # 2차: 근사 매칭(공통 부분이 긴 것 우선)
+    for r in rows:
+        if r.get("Link"):
+            continue
+        b = url_basename(r.get("Src", ""))
+        if not b:
+            continue
+        best_link = None
+        best_score = 0
+        for pbname, links in index.items():
+            score = lcs_len(b, pbname)
+            if score > best_score:
+                best_score = score
+                best_link = sorted(links)[0]
+        # 최소 길이(휴리스틱)로 과매칭 방지
+        if best_link and best_score >= max(5, len(b) // 3):
+            r["Link"] = best_link
+
+    # 3차: 여전히 비었으면 사이트 홈(혹은 그대로 빈 값 유지 원하면 주석 처리)
+    for r in rows:
+        if not r.get("Link"):
+            r["Link"] = urljoin(BASE_URL, "/desktop")
+
+    return rows
+
+# -------------------------
+# Google Drive 업로드
+# -------------------------
 def upload_to_gdrive(local_path: str, filename: str) -> str:
     """
     CSV를 구글 '공유드라이브' 폴더에 업로드(동일 파일명 있으면 update, 없으면 create).
@@ -217,7 +254,7 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
       - GDRIVE_DRIVE_ID (선택)          # 공유드라이브 ID (검색 최적화)
     반환: file_id
     """
-    import os, json
+    import json as _json
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
@@ -237,7 +274,7 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
     creds = None
     if raw_json:
         try:
-            info = json.loads(raw_json)
+            info = _json.loads(raw_json)
             creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
         except Exception as e:
             raise RuntimeError(f"GDRIVE_CREDENTIALS_JSON 파싱 실패: {e}")
@@ -252,7 +289,7 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
 
     drive = build("drive", "v3", credentials=creds)
 
-    # 0) 폴더 유효성 & 권한 검증
+    # 폴더 유효성 & 권한 검증
     try:
         folder_meta = drive.files().get(
             fileId=folder_id,
@@ -306,20 +343,44 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
             "서비스계정 권한(공유드라이브 구성원)과 GDRIVE_FOLDER_ID가 공유드라이브 폴더인지 확인하세요."
         )
 
+# -------------------------
+# main
+# -------------------------
 def main():
     html = fetch_html(BASE_URL)
+
+    # 디버그: 원문 저장
+    try:
+        with open("debug_home.html", "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception:
+        pass
+
     soup = BeautifulSoup(html, "lxml")
-    rows = collect_from_static_dom(soup) or collect_from_next_data(soup) or collect_fallback_imgs(soup)
-    df = pd.DataFrame(rows).drop_duplicates()
+
+    # 1) DOM에서 이미지/alt 수집
+    rows = collect_from_static_dom(soup)
+
+    # 2) __NEXT_DATA__에서 (img, link) 페어 수집 후 매칭
+    pairs = collect_next_banner_pairs(soup)
+    rows = fill_links_with_next_pairs(rows, pairs)
+
+    # 3) 정제/저장
+    cleaned = [
+        r for r in rows
+        if any([r.get("Link"), r.get("Src"), r.get("Srcset_Modified")])
+    ]
+    df = pd.DataFrame(cleaned).drop_duplicates()
 
     out_csv = "jasoseol_banner.csv"
     df.to_csv(out_csv, index=False, encoding="utf-8-sig", lineterminator="\n")
     print(f"[OK] {len(df)}개 배너 수집 완료 → {out_csv}")
 
-    # === 업로드 강제 호출 (로그 반드시 찍기) ===
+    # 4) 구글 드라이브 업로드
     print("[INFO] Google Drive 업로드 시작…")
-    file_id = upload_to_gdrive(out_csv, "jasoseol_banner.csv")  # 예외는 그대로 raise
+    file_id = upload_to_gdrive(out_csv, "jasoseol_banner.csv")
     print(f"[OK] Drive 업로드 완료 fileId={file_id}")
 
 if __name__ == "__main__":
     main()
+
