@@ -7,8 +7,11 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, unquote, parse_qs
 from typing import Any, Iterable, List, Dict, Tuple
 
+# =========================
+# Config
+# =========================
 BASE_ORIGIN = "https://jasoseol.com"
-CANDIDATE_PATHS = ["/desktop", "/"]  # 데스크톱 페이지 우선, 실패 시 루트
+CANDIDATE_PATHS = ["/desktop", "/"]  # 데스크톱 우선, 실패 시 루트
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -23,13 +26,21 @@ DEFAULT_HEADERS = {
 
 IMG_EXT_RE = re.compile(r"\.(?:png|jpg|jpeg|webp|gif)(?:\?.*)?$", re.IGNORECASE)
 
-# -------------------------
-# HTTP / Parsing helpers
-# -------------------------
-def fetch_html(url: str) -> str:
-    resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=20)
-    resp.raise_for_status()
-    return resp.text
+# =========================
+# HTTP / helpers
+# =========================
+def fetch_html(url: str) -> str | None:
+    """404/네트워크 오류를 잡고 None 반환 → 상위에서 fallback 시도 가능."""
+    try:
+        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=20)
+        if resp.status_code == 404:
+            print(f"[WARN] 404 Not Found: {url}")
+            return None
+        resp.raise_for_status()
+        return resp.text
+    except requests.RequestException as e:
+        print(f"[ERROR] Fetch 실패: {url} ({e})")
+        return None
 
 def looks_like_img(url: str) -> bool:
     if not url:
@@ -64,7 +75,7 @@ def parse_srcset_modified(srcset: str) -> str:
     Selenium 수동 코드 규칙 재현:
     - ', ' 로 split 후 마지막 항목 제거
     - 각 항목은 'url width' 중 url만 취함
-    - 상대경로면 'https://jasoseol.com' 접두사
+    - 상대경로면 BASE_ORIGIN 접두사
     """
     if not srcset:
         return ""
@@ -90,9 +101,9 @@ def lcs_len(a: str, b: str) -> int:
                 best = max(best, j - i)
     return best
 
-# -------------------------
+# =========================
 # DOM collectors (보이는 배너 우선 + 전체 fallback)
-# -------------------------
+# =========================
 def collect_from_static_dom(soup: BeautifulSoup) -> List[Dict]:
     rows: List[Dict] = []
 
@@ -113,22 +124,32 @@ def collect_from_static_dom(soup: BeautifulSoup) -> List[Dict]:
             continue
         seen.add(key)
         rows.append({
-            "Link": "",     # 나중에 채움
+            "Link": "",     # 나중에 채움 (__NEXT_DATA__ 매칭)
             "Alt": alt,
             "Src": src,
             "Srcset": srcset_mod,
         })
     return rows
 
-# -------------------------
+# =========================
 # __NEXT_DATA__ collectors (img ↔ link 페어)
-# -------------------------
+# =========================
+def deep_iter(v: Any) -> Iterable[Any]:
+    if isinstance(v, dict):
+        for vv in v.values():
+            yield from deep_iter(vv)
+    elif isinstance(v, list):
+        for vv in v:
+            yield from deep_iter(vv)
+    else:
+        yield v
+
 def collect_next_banner_pairs(soup: BeautifulSoup) -> List[Dict]:
     tag = soup.find("script", id="__NEXT_DATA__")
     if not tag or not tag.text:
         return []
 
-    # 디버그 저장(선택)
+    # (선택) 디버그 저장
     try:
         with open("debug_next_data.json", "w", encoding="utf-8") as f:
             f.write(tag.text)
@@ -177,17 +198,18 @@ def collect_next_banner_pairs(soup: BeautifulSoup) -> List[Dict]:
         uniq[key] = p
     return list(uniq.values())
 
-# -------------------------
+# =========================
 # Link 매칭 (파일명 동일 → 근사 유사도 → 기본값)
-# -------------------------
+# =========================
 def fill_links_with_next_pairs(rows: List[Dict], pairs: List[Dict]) -> List[Dict]:
     if not rows:
         return rows
 
     if not pairs:
+        # 그래도 빈 Link는 기본값 보정
         for r in rows:
             if not r.get("Link"):
-                r["Link"] = urljoin(BASE_ORIGIN, "/desktop")
+                r["Link"] = urljoin(BASE_ORIGIN, "/")
         return rows
 
     index: Dict[str, set] = {}
@@ -219,16 +241,16 @@ def fill_links_with_next_pairs(rows: List[Dict], pairs: List[Dict]) -> List[Dict
         if best_link and best_score >= max(5, len(b) // 3):
             r["Link"] = best_link
 
-    # 3차: 기본값 보정
+    # 3차: 기본값 보정(홈)
     for r in rows:
         if not r.get("Link"):
-            r["Link"] = urljoin(BASE_ORIGIN, "/desktop")
+            r["Link"] = urljoin(BASE_ORIGIN, "/")
 
     return rows
 
-# -------------------------
+# =========================
 # Google Drive 업로드
-# -------------------------
+# =========================
 def upload_to_gdrive(local_path: str, filename: str) -> str:
     import json as _json
     from google.oauth2 import service_account
@@ -287,12 +309,16 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
         ).execute()
         return file["id"]
 
-# -------------------------
+# =========================
 # main
-# -------------------------
+# =========================
 def scrape_once(full_url: str) -> Tuple[List[Dict], List[Dict], str]:
     html = fetch_html(full_url)
-    # 디버그 저장
+    if not html:
+        print(f"[DEBUG] URL={full_url} → HTML 없음")
+        return [], [], full_url
+
+    # (선택) 디버그 저장
     try:
         with open("debug_home.html", "w", encoding="utf-8") as f:
             f.write(html)
@@ -340,3 +366,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
