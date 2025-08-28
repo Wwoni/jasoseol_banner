@@ -208,36 +208,104 @@ def main():
     from googleapiclient.http import MediaFileUpload
     from google.oauth2 import service_account
 
-def upload_to_gdrive(file_path: str, drive_id: str, folder_id: str | None = None):
-    # Secret에 저장한 JSON 키 불러오기
-    creds_json = os.environ.get("GDRIVE_CREDENTIALS_JSON")
-    if not creds_json:
-        raise RuntimeError("환경변수 GDRIVE_CREDENTIALS_JSON 이 없습니다.")
-    
-    creds_dict = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/drive.file",
-                "https://www.googleapis.com/auth/drive"]
-    )
+def upload_to_gdrive(local_path: str, filename: str) -> str:
+    """
+    CSV를 구글 '공유드라이브' 폴더에 업로드(동일 파일명 있으면 update, 없으면 create).
+    환경변수:
+      - GDRIVE_FOLDER_ID (필수)
+      - GDRIVE_CREDENTIALS_JSON (필수)  # 서비스계정 JSON 원문 (권장 방식)
+        또는 GDRIVE_SA_JSON_PATH (선택)  # gdrive_sa.json 같은 파일 경로
+      - GDRIVE_DRIVE_ID (선택)          # 공유드라이브 ID (검색 최적화)
+    반환: file_id
+    """
+    import os, json
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    from googleapiclient.errors import HttpError
 
-    service = build("drive", "v3", credentials=creds)
+    folder_id = os.environ.get("GDRIVE_FOLDER_ID")
+    drive_id = os.environ.get("GDRIVE_DRIVE_ID")  # optional
+    raw_json = os.environ.get("GDRIVE_CREDENTIALS_JSON")
+    sa_path = os.environ.get("GDRIVE_SA_JSON_PATH")  # optional
 
-    file_metadata = {
-        "name": os.path.basename(file_path),
-        "driveId": drive_id,
-        "parents": [folder_id] if folder_id else None
+    if not folder_id:
+        raise RuntimeError("GDRIVE_FOLDER_ID가 설정되지 않았습니다.")
+
+    scopes = ["https://www.googleapis.com/auth/drive"]
+
+    # 1) 시크릿 문자열 방식 우선
+    creds = None
+    if raw_json:
+        try:
+            info = json.loads(raw_json)
+            creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        except Exception as e:
+            raise RuntimeError(f"GDRIVE_CREDENTIALS_JSON 파싱 실패: {e}")
+
+    # 2) 파일 방식 백업
+    if creds is None:
+        if not sa_path:
+            sa_path = "gdrive_sa.json"
+        if not os.path.exists(sa_path):
+            raise FileNotFoundError(f"서비스계정 파일을 찾을 수 없습니다: {sa_path}")
+        creds = service_account.Credentials.from_service_account_file(sa_path, scopes=scopes)
+
+    drive = build("drive", "v3", credentials=creds)
+
+    # 0) 폴더 유효성 & 권한 검증
+    try:
+        folder_meta = drive.files().get(
+            fileId=folder_id,
+            fields="id,name,driveId,mimeType",
+            supportsAllDrives=True,
+        ).execute()
+        if folder_meta.get("mimeType") != "application/vnd.google-apps.folder":
+            raise RuntimeError(f"GDRIVE_FOLDER_ID가 폴더가 아닙니다: {folder_meta.get('mimeType')}")
+    except HttpError as he:
+        raise RuntimeError(
+            f"폴더 조회 실패: {he}. "
+            "공유드라이브 폴더 ID가 맞는지, 서비스계정이 해당 드라이브의 구성원인지 확인하세요."
+        )
+
+    # 동일 파일명 검색
+    query = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
+    list_kwargs = {
+        "q": query,
+        "fields": "files(id,name)",
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
     }
-    media = MediaFileUpload(file_path, mimetype="text/csv")
+    if drive_id:
+        list_kwargs.update({"driveId": drive_id, "corpora": "drive"})
 
-    uploaded = service.files().create(
-        body=file_metadata,
-        media_body=media,
-        supportsAllDrives=True,
-        fields="id, name"
-    ).execute()
+    resp = drive.files().list(**list_kwargs).execute()
+    files = resp.get("files", [])
+    media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
 
-    print(f"[OK] Google Drive 업로드 완료 → {uploaded.get('name')} (id={uploaded.get('id')})")
+    try:
+        if files:
+            file_id = files[0]["id"]
+            drive.files().update(
+                fileId=file_id,
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute()
+            return file_id
+        else:
+            metadata = {"name": filename, "parents": [folder_id]}
+            file = drive.files().create(
+                body=metadata,
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            return file["id"]
+    except HttpError as he:
+        raise RuntimeError(
+            f"업로드 실패: {he}. "
+            "서비스계정 권한(공유드라이브 구성원)과 GDRIVE_FOLDER_ID가 공유드라이브 폴더인지 확인하세요."
+        )
 
 def main():
     html = fetch_html(BASE_URL)
