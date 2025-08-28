@@ -2,8 +2,8 @@
 import os, json
 import pandas as pd
 from urllib.parse import urljoin, urlparse, unquote
-from typing import List, Dict, Tuple, Optional
-from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
+from typing import List, Dict, Optional
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -13,7 +13,7 @@ BASE_URL = "https://jasoseol.com/"
 OUTPUT_CSV = "jasoseol_banner.csv"
 
 # -------------------------
-# 작은 유틸들
+# Utils
 # -------------------------
 def url_basename(url: str) -> str:
     if not url:
@@ -24,22 +24,12 @@ def looks_like_img(url: str) -> bool:
     if not url:
         return False
     u = url.lower()
-    return (".png" in u) or (".jpg" in u) or (".jpeg" in u) or (".webp" in u) or (".gif" in u) or ("/_next/image" in u and "url=" in u)
-
-def lcs_len(a: str, b: str) -> int:
-    short, long = (a, b) if len(a) <= len(b) else (b, a)
-    best = 0
-    for i in range(len(short)):
-        for j in range(i + 1, len(short) + 1):
-            seg = short[i:j]
-            if seg and seg in long:
-                best = max(best, j - i)
-    return best
+    return any(ext in u for ext in [".png", ".jpg", ".jpeg", ".webp", ".gif"]) or ("/_next/image" in u and "url=" in u)
 
 # -------------------------
-# __NEXT_DATA__에서 (img, link) 페어 추출
+# Fallback: __NEXT_DATA__에서 (img, link) 보수적 추출
 # -------------------------
-def collect_next_pairs(page: Page) -> List[Dict]:
+def collect_next_pairs(page) -> List[Dict]:
     pairs: List[Dict] = []
     tag = page.query_selector("script#__NEXT_DATA__")
     if not tag:
@@ -49,145 +39,142 @@ def collect_next_pairs(page: Page) -> List[Dict]:
 
         def walk(node):
             if isinstance(node, dict):
+                # 같은 오브젝트 내 문자열만 평가
                 flat = []
                 for v in node.values():
                     if isinstance(v, (dict, list)):
                         walk(v)
                     else:
                         flat.append(v)
+
                 imgs, links = [], []
                 for s in flat:
                     if not isinstance(s, str):
                         continue
                     if looks_like_img(s):
                         imgs.append(s)
-                    elif s.startswith("/") or s.startswith("http"):
-                        # 이미지 문자열이 아닌 링크 후보만
-                        if not looks_like_img(s):
-                            links.append(s)
+                    elif (s.startswith("/") or s.startswith("http")) and not looks_like_img(s):
+                        links.append(s)
+
+                # 이미지와 링크가 같은 오브젝트 안에 같이 있을 때만 페어링
                 if imgs and links:
-                    # 동일 object 내에 같이 있던 첫 링크를 우선 채택
+                    link0 = links[0]
+                    link_abs = urljoin(BASE_URL, link0) if link0.startswith("/") else link0
                     for si in imgs:
-                        link_abs = urljoin(BASE_URL, links[0]) if links[0].startswith("/") else links[0]
                         pairs.append({"img": si, "link": link_abs})
+
             elif isinstance(node, list):
                 for v in node:
                     walk(v)
 
         walk(data)
-    except Exception:
-        pass
 
-    # 유니크 처리 (img basename + link)
-    uniq = {}
-    for p in pairs:
-        key = (url_basename(p["img"]), p["link"])
-        uniq[key] = p
-    return list(uniq.values())
+        # 유니크
+        seen = set()
+        uniq = []
+        for p in pairs:
+            key = (url_basename(p["img"]), p["link"])
+            if key not in seen:
+                seen.add(key)
+                uniq.append(p)
+        return uniq
+    except Exception:
+        return pairs
 
 # -------------------------
-# Playwright로 전체 수집 + 실제 클릭 URL 캡처
+# Playwright: 각 이미지 "그 자체"를 클릭해 랜딩 URL 캡처
 # -------------------------
 def scrape_all() -> List[Dict]:
     rows: List[Dict] = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.goto(BASE_URL, timeout=40000, wait_until="networkidle")
-        page.wait_for_selector(".main-banner-ggs img", timeout=15000)
+        # 네트워크가 모두 잠잠할 때까지: CSR 렌더 완성
+        page.goto(BASE_URL, timeout=45000, wait_until="networkidle")
+        page.wait_for_selector(".main-banner-ggs img", timeout=20000)
 
-        # 1) DOM에서 Alt, Src, 노드 핸들 수집
-        imgs = page.query_selector_all(".main-banner-ggs img")
-        banners = page.query_selector_all(".main-banner-ggs")
-        # 안전장치: 길이 차이나면 img 기준으로 맞춤
-        n = min(len(imgs), len(banners)) if banners else len(imgs)
+        # 슬라이더 자동 회전 간섭 방지: 살짝 호버 & 스크롤
+        first = page.locator(".main-banner-ggs img").first
+        try:
+            first.scroll_into_view_if_needed(timeout=2000)
+            first.hover(timeout=2000)
+        except PWTimeout:
+            pass
 
-        temp = []
-        for i in range(n):
-            alt = imgs[i].get_attribute("alt") or ""
-            src = imgs[i].get_attribute("src") or ""
-            if src and not src.startswith("http"):
-                src = urljoin(BASE_URL, src)
-            temp.append({"Alt": alt, "Src": src, "Link": "", "_idx": i})
+        img_loc = page.locator(".main-banner-ggs img")
+        count = img_loc.count()
 
-        # 2) __NEXT_DATA__ 페어 인덱스
+        # __NEXT_DATA__ 보조 인덱스 (클릭 실패 시에만 사용)
         pairs = collect_next_pairs(page)
-        idx = {}
+        by_name = {}
         for pz in pairs:
             b = url_basename(pz["img"])
-            idx.setdefault(b, set()).add(pz["link"])
+            by_name.setdefault(b, set()).add(pz["link"])
 
-        # 3) 먼저 JSON 매칭(정확/근사)
-        for r in temp:
-            b = url_basename(r["Src"])
-            if b in idx and idx[b]:
-                r["Link"] = sorted(idx[b])[0]
-                continue
-            # 근사 매칭
-            best_link, best_score = "", 0
-            for pb, links in idx.items():
-                score = lcs_len(b, pb)
-                if score > best_score:
-                    best_score, best_link = score, sorted(links)[0]
-            if best_link and best_score >= max(5, len(b)//3):
-                r["Link"] = best_link
+        for i in range(count):
+            img = img_loc.nth(i)
 
-        # 4) 여전히 비었거나, 도메인이 이미지와 무관해 보이는 경우 → 실제 클릭으로 재확인
-        for r in temp:
-            need_click = False
-            if not r["Link"]:
-                need_click = True
-            else:
-                # 휴리스틱: 이미지 파일명/alt와 링크가 전혀 연관 없어 보이면 클릭으로 재검증
-                host = urlparse(r["Link"]).netloc
-                b = url_basename(r["Src"]).lower()
-                alt = (r["Alt"] or "").lower()
-                if ("jasoseol" not in host) and (lcs_len(host, b) < 3 and lcs_len(host, alt) < 3):
-                    need_click = True
+            # Alt, Src 확보
+            alt = img.get_attribute("alt") or ""
+            src = img.get_attribute("src") or ""
+            if src and not src.startswith("http"):
+                src = urljoin(BASE_URL, src)
 
-            if not need_click:
-                continue
-
-            i = r["_idx"]
-            # 클릭 시 실제 이동 URL 캡처 (팝업/동일탭 내비게이션 모두 커버)
+            link_final: Optional[str] = None
             origin_url = page.url
-            real_url: Optional[str] = None
 
+            # 이미지 요소 자체 클릭 → 팝업 또는 동일 탭 네비게이션 감지
             try:
-                with page.expect_event("popup", timeout=2000) as pop_watcher:
-                    banners[i].click(force=True)
-                new_page = pop_watcher.value
+                img.scroll_into_view_if_needed(timeout=2000)
+            except PWTimeout:
+                pass
+
+            # 1) 팝업 우선 감지
+            try:
+                with page.expect_event("popup", timeout=2000) as pop_waiter:
+                    img.click(force=True, timeout=2000)
+                new_page = pop_waiter.value
                 try:
-                    new_page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    new_page.wait_for_load_state("domcontentloaded", timeout=6000)
                 except PWTimeout:
                     pass
-                real_url = new_page.url
+                link_final = new_page.url
                 new_page.close()
             except PWTimeout:
-                # 팝업이 아니면 동일 탭 내 라우팅일 수 있음
+                # 2) 동일 탭 라우팅 감지
                 try:
-                    # URL 변경 대기 (Next.js 클라이언트 라우팅)
-                    page.wait_for_function("url => url !== window.location.href", arg=origin_url, timeout=2000)
+                    img.click(force=True, timeout=2000)
                 except PWTimeout:
                     pass
+
+                # URL 변경 기다림
+                try:
+                    page.wait_for_load_state("networkidle", timeout=3000)
+                except PWTimeout:
+                    pass
+
                 if page.url != origin_url:
-                    real_url = page.url
+                    link_final = page.url
                     # 원래 페이지로 복귀
                     try:
-                        page.go_back(wait_until="domcontentloaded", timeout=5000)
+                        page.go_back(wait_until="networkidle", timeout=6000)
                     except PWTimeout:
                         page.goto(BASE_URL, wait_until="networkidle", timeout=15000)
+                        page.wait_for_selector(".main-banner-ggs img", timeout=15000)
 
-            # 클릭으로 얻은 URL이 있으면 교체
-            if real_url:
-                r["Link"] = real_url
+            # 3) 클릭으로 못 얻었으면 __NEXT_DATA__에서 보수적으로 매칭
+            if not link_final:
+                bname = url_basename(src)
+                if bname in by_name and by_name[bname]:
+                    link_final = sorted(by_name[bname])[0]
 
-        # 5) 최종 정리
-        for r in temp:
-            rows.append({"Alt": r["Alt"], "Src": r["Src"], "Link": r["Link"] or r["Src"]})
+            # 4) 그래도 없으면 이미지 URL로 폴백
+            if not link_final:
+                link_final = src
+
+            rows.append({"Alt": alt, "Src": src, "Link": link_final})
 
         browser.close()
-
     return rows
 
 # -------------------------
@@ -201,14 +188,9 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
         raise RuntimeError("GDRIVE_FOLDER_ID가 설정되지 않았습니다.")
 
     scopes = ["https://www.googleapis.com/auth/drive"]
-    creds = None
-    if raw_json:
-        info = json.loads(raw_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-    else:
-        creds = service_account.Credentials.from_service_account_file(sa_path, scopes=scopes)
-
+    creds = service_account.Credentials.from_service_account_info(json.loads(raw_json), scopes=scopes) if raw_json else service_account.Credentials.from_service_account_file(sa_path, scopes=scopes)
     drive = build("drive", "v3", credentials=creds)
+
     q = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
     resp = drive.files().list(q=q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
     files = resp.get("files", [])
@@ -238,4 +220,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
