@@ -2,13 +2,14 @@ import os
 import json
 import pandas as pd
 from urllib.parse import urljoin, urlparse, unquote
+from typing import List, Dict
 from playwright.sync_api import sync_playwright
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from googleapiclient.errors import HttpError
 
 BASE_URL = "https://jasoseol.com/"
+OUTPUT_CSV = "jasoseol_banner.csv"
 
 # --------------------
 # Helpers
@@ -18,6 +19,12 @@ def url_basename(url: str) -> str:
         return ""
     u = unquote(url)
     return os.path.basename(urlparse(u).path)
+
+def looks_like_img(url: str) -> bool:
+    if not url:
+        return False
+    u = url.lower()
+    return any(ext in u for ext in [".png", ".jpg", ".jpeg", ".webp", ".gif"]) or ("/_next/image" in u and "url=" in u)
 
 def lcs_len(a: str, b: str) -> int:
     short, long = (a, b) if len(a) <= len(b) else (b, a)
@@ -32,73 +39,96 @@ def lcs_len(a: str, b: str) -> int:
 # --------------------
 # Playwright 크롤링
 # --------------------
-def scrape_banners():
-    rows = []
+def scrape_banners() -> List[Dict]:
+    rows: List[Dict] = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.goto(BASE_URL, timeout=30000)
-        page.wait_for_selector(".main-banner-ggs img", timeout=10000)
+        page.goto(BASE_URL, timeout=40000, wait_until="networkidle")
 
-        # 이미지 태그들 추출
-        banners = page.query_selector_all(".main-banner-ggs img")
-        for img in banners:
+        # 모든 슬라이드 이미지 로딩 대기
+        page.wait_for_selector(".main-banner-ggs img", timeout=15000)
+
+        # DOM에서 Alt, Src 수집 (보이는+숨김 모두)
+        imgs = page.query_selector_all(".main-banner-ggs img")
+        for img in imgs:
             alt = img.get_attribute("alt") or ""
             src = img.get_attribute("src") or ""
+            if src and not src.startswith("http"):
+                src = urljoin(BASE_URL, src)
             rows.append({"Alt": alt, "Src": src, "Link": ""})
 
-        # __NEXT_DATA__ JSON 추출
+        # __NEXT_DATA__ 파싱해서 (img, link) 페어 수집
+        pairs: List[Dict] = []
         tag = page.query_selector("script#__NEXT_DATA__")
-        pairs = []
         if tag:
             try:
                 data = json.loads(tag.inner_text())
+
                 def walk(node):
                     if isinstance(node, dict):
-                        strings = []
+                        # 이 dict 안의 단순 문자열 모아 판단
+                        flat = []
                         for v in node.values():
                             if isinstance(v, (dict, list)):
                                 walk(v)
                             else:
-                                strings.append(v)
-                        imgs, links = [], []
-                        for s in strings:
+                                flat.append(v)
+                        imgs_, links_ = [], []
+                        for s in flat:
                             if not isinstance(s, str):
                                 continue
-                            if ".png" in s or ".jpg" in s or ".jpeg" in s or ".webp" in s:
-                                imgs.append(s)
-                            elif isinstance(s, str) and s.startswith("/"):
-                                links.append(s)
-                        if imgs and links:
-                            for si in imgs:
-                                pairs.append({"img": si, "link": urljoin(BASE_URL, links[0])})
+                            if looks_like_img(s):
+                                imgs_.append(s)
+                            # 여기! 절대URL(https://...)도 링크로 인정
+                            elif s.startswith("/") or s.startswith("http"):
+                                if not looks_like_img(s):
+                                    links_.append(s)
+                        if imgs_ and links_:
+                            for si in imgs_:
+                                link_abs = urljoin(BASE_URL, links_[0]) if links_[0].startswith("/") else links_[0]
+                                pairs.append({"img": si, "link": link_abs})
+
                     elif isinstance(node, list):
                         for v in node:
                             walk(v)
+
                 walk(data)
             except Exception:
                 pass
 
-        # 이미지 ↔ 링크 매칭
+        # 이미지 ↔ 링크 매칭 (파일명 동일 → 근사 유사도)
         index = {}
-        for p_ in pairs:
-            index.setdefault(url_basename(p_["img"]), set()).add(p_["link"])
+        for pz in pairs:
+            b = url_basename(pz["img"])
+            index.setdefault(b, set()).add(pz["link"])
 
         for r in rows:
+            if r["Link"]:
+                continue
             b = url_basename(r["Src"])
-            if b in index:
+            if not b:
+                continue
+            # exact
+            if b in index and index[b]:
                 r["Link"] = sorted(index[b])[0]
-            else:
-                # 근사 매칭
-                best_link, best_score = None, 0
-                for pbname, links in index.items():
-                    score = lcs_len(b, pbname)
-                    if score > best_score:
-                        best_score, best_link = score, sorted(links)[0]
-                if best_link and best_score >= max(5, len(b) // 3):
-                    r["Link"] = best_link
+                continue
+            # fuzzy
+            best_link, best_score = "", 0
+            for pb, links in index.items():
+                score = lcs_len(b, pb)
+                if score > best_score:
+                    best_score, best_link = score, sorted(links)[0]
+            if best_link and best_score >= max(5, len(b)//3):
+                r["Link"] = best_link
+
+        # 여전히 비었으면 이미지 주소로 폴백 (요청 반영)
+        for r in rows:
+            if not r["Link"]:
+                r["Link"] = r["Src"]
 
         browser.close()
+
     return rows
 
 # --------------------
@@ -108,7 +138,6 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
     folder_id = os.environ.get("GDRIVE_FOLDER_ID")
     raw_json = os.environ.get("GDRIVE_CREDENTIALS_JSON")
     sa_path = os.environ.get("GDRIVE_SA_JSON_PATH", "gdrive_sa.json")
-
     if not folder_id:
         raise RuntimeError("GDRIVE_FOLDER_ID가 설정되지 않았습니다.")
 
@@ -118,25 +147,21 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
         info = json.loads(raw_json)
         creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
     else:
-        if not os.path.exists(sa_path):
-            raise FileNotFoundError(f"서비스계정 파일을 찾을 수 없습니다: {sa_path}")
         creds = service_account.Credentials.from_service_account_file(sa_path, scopes=scopes)
 
     drive = build("drive", "v3", credentials=creds)
-
-    # 동일 파일명 검색
-    query = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
-    resp = drive.files().list(q=query, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+    q = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
+    resp = drive.files().list(q=q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
     files = resp.get("files", [])
     media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
 
     if files:
-        file_id = files[0]["id"]
-        drive.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
-        return file_id
+        fid = files[0]["id"]
+        drive.files().update(fileId=fid, media_body=media, supportsAllDrives=True).execute()
+        return fid
     else:
-        metadata = {"name": filename, "parents": [folder_id]}
-        file = drive.files().create(body=metadata, media_body=media, fields="id", supportsAllDrives=True).execute()
+        meta = {"name": filename, "parents": [folder_id]}
+        file = drive.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()
         return file["id"]
 
 # --------------------
@@ -145,13 +170,13 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
 def main():
     rows = scrape_banners()
     df = pd.DataFrame(rows).drop_duplicates()
-    out_csv = "jasoseol_banner.csv"
-    df.to_csv(out_csv, index=False, encoding="utf-8-sig", lineterminator="\n")
-    print(f"[OK] {len(df)}개 배너 수집 완료 → {out_csv}")
+    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig", lineterminator="\n")
+    print(f"[OK] {len(df)}개 배너 수집 완료 → {OUTPUT_CSV}")
 
     print("[INFO] Google Drive 업로드 시작…")
-    file_id = upload_to_gdrive(out_csv, "jasoseol_banner.csv")
-    print(f"[OK] Drive 업로드 완료 fileId={file_id}")
+    fid = upload_to_gdrive(OUTPUT_CSV, "jasoseol_banner.csv")
+    print(f"[OK] Drive 업로드 완료 fileId={fid}")
 
 if __name__ == "__main__":
     main()
+
