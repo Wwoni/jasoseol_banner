@@ -3,7 +3,7 @@ name: Scrape Jasoseol Banners
 on:
   workflow_dispatch: {}
   schedule:
-    # 매주 월요일 01:00 UTC 실행 = 한국시간(KST, UTC+9) 오전(10:00)
+    # 매주 월요일 01:00 UTC 실행 = 한국시간(KST, UTC+9) 10:00
     - cron: "0 1 * * 1"
 
 permissions:
@@ -24,66 +24,81 @@ jobs:
 
       - name: Install dependencies
         run: |
-           python -m pip install --upgrade pip
-           pip install -r requirements.txt      
-      
-      # requirements 설치 후
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Write service account JSON
         env:
           GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
           if [ -z "${GDRIVE_CREDENTIALS_JSON}" ]; then
             echo "::error::GDRIVE_CREDENTIALS_JSON secret is empty or not visible to this workflow."
-           exit 1
+            exit 1
           fi
-          # JSON 원문을 파일로 저장
           printf '%s' "$GDRIVE_CREDENTIALS_JSON" > gdrive_sa.json
-          # 존재/크기 점검
           test -s gdrive_sa.json || (echo "::error::gdrive_sa.json is empty after write" && exit 1)
-          # (선택) 파일 상위 몇 줄 출력해보기
           head -n 2 gdrive_sa.json || true
 
-      # (선택) 폴더 접근 사전검증
+      # Playwright: 파이썬 패키지 + 브라우저 + 리눅스 의존성 설치
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          python - <<'PY'
+          import sys, subprocess
+          # gdrive 업로드용 라이브러리 보강
+          try:
+              import googleapiclient  # noqa
+          except ImportError:
+              subprocess.check_call([sys.executable, "-m", "pip", "install",
+                                     "google-api-python-client", "google-auth", "google-auth-httplib2"])
+          PY
+          # 브라우저 바이너리 및 필수 OS 라이브러리 설치
+          python - <<'PY'
+          import subprocess
+          subprocess.check_call(["playwright", "install", "chromium"])
+          try:
+              # 리눅스 필수 deps (없으면 스크린샷/렌더 실패 가능)
+              subprocess.check_call(["npx", "--yes", "playwright", "install-deps"])
+          except Exception:
+              pass
+          PY
+
+      # (선택) 폴더 접근 사전검증 - 파일 인증 사용
       - name: Verify Drive folder access
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
           python - <<'PY'
-          import os, json
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
-          raw = os.environ["GDRIVE_CREDENTIALS_JSON"]
           creds = service_account.Credentials.from_service_account_file(
               "gdrive_sa.json", scopes=["https://www.googleapis.com/auth/drive"]
           )
           svc = build("drive","v3",credentials=creds)
-          meta = svc.files().get(fileId=os.environ["GDRIVE_FOLDER_ID"],
-                           fields="id,name,driveId,mimeType",
-                           supportsAllDrives=True).execute()
+          meta = svc.files().get(fileId="${{ secrets.GDRIVE_FOLDER_ID }}",
+                                 fields="id,name,driveId,mimeType",
+                                 supportsAllDrives=True).execute()
           print("Folder OK:", meta)
           PY
 
-      # 실제 실행
       - name: Run crawler & upload
         env:
+          # 파이썬 스크립트는 우선 GDRIVE_CREDENTIALS_JSON(문자열) → 없으면 gdrive_sa.json 파일을 사용
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}   # ← 파이썬이 이 경로를 읽도록
+          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
         run: |
           python jasoseol_banner.py
 
-      # (옵션) 결과물/디버그 아티팩트 업로드
-      - name: Upload artifacts
+      - name: Upload artifacts (CSV only)
         uses: actions/upload-artifact@v4
         with:
           name: jasoseol_banner_outputs
           path: |
             jasoseol_banner.csv
-            last_run.txt
+          if-no-files-found: warn
 
-      # (옵션) 실행 파일에 업로드 코드가 있는지 바로 로그로 확인
       - name: Show script head (sanity)
+        if: always()
         run: |
           sed -n '1,200p' jasoseol_banner.py
-          echo "grep upload_to_drive:"; grep -n "upload_to_drive" jasoseol_banner.py || true
           echo "grep Drive 업로드 로그:"; grep -n "Drive 업로드" jasoseol_banner.py || true
