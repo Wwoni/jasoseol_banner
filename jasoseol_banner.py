@@ -1,5 +1,5 @@
 # jasoseol_banner.py
-import os, time, re, json
+import os, time, re, json, pathlib, traceback
 import pandas as pd
 from urllib.parse import unquote
 from typing import List, Dict, Tuple
@@ -9,12 +9,41 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/120.0.0.0 Safari/537.36")
 
+DEBUG_DIR = pathlib.Path("debug")
+
+# ------------------------- Debug helpers -------------------------
+def ensure_debug_dir():
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+def slug(s: str, maxlen: int = 60) -> str:
+    s = re.sub(r"[^0-9A-Za-z가-힣_]+", "_", s or "").strip("_")
+    return (s[:maxlen] or "no_title")
+
+def write_debug_txt(name: str, content: str):
+    ensure_debug_dir()
+    p = DEBUG_DIR / name
+    try:
+        p.write_text(content, encoding="utf-8")
+    except Exception:
+        # 최후 수단
+        try:
+            p.write_bytes(content.encode("utf-8", "ignore"))
+        except Exception:
+            pass
+
+def append_jsonl(name: str, obj: dict):
+    ensure_debug_dir()
+    p = DEBUG_DIR / name
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
 # ------------------------- Google Drive -------------------------
 def upload_to_gdrive(local_path: str, filename: str) -> str:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
     from googleapiclient.errors import HttpError
+
     folder_id = os.environ.get("GDRIVE_FOLDER_ID")
     drive_id = os.environ.get("GDRIVE_DRIVE_ID")
     raw_json = os.environ.get("GDRIVE_CREDENTIALS_JSON")
@@ -22,6 +51,7 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
     if not folder_id:
         raise RuntimeError("GDRIVE_FOLDER_ID가 설정되지 않았습니다.")
     scopes = ["https://www.googleapis.com/auth/drive"]
+
     creds = None
     if raw_json:
         creds = service_account.Credentials.from_service_account_info(
@@ -32,15 +62,16 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
         if not os.path.exists(sa_path):
             raise FileNotFoundError(f"서비스계정 파일을 찾을 수 없습니다: {sa_path}")
         creds = service_account.Credentials.from_service_account_file(sa_path, scopes=scopes)
+
     drive = build("drive", "v3", credentials=creds)
-    # 폴더 검증
     drive.files().get(fileId=folder_id, fields="id", supportsAllDrives=True).execute()
-    # upsert
+
     q = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
     kw = dict(q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True)
     if drive_id: kw.update(driveId=drive_id, corpora="drive")
     found = drive.files().list(**kw).execute().get("files", [])
     media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
+
     if found:
         fid = found[0]["id"]
         drive.files().update(fileId=fid, media_body=media, supportsAllDrives=True).execute()
@@ -62,11 +93,16 @@ def close_modal_if_present(page) -> None:
         for s in sels:
             loc = page.locator(s)
             if loc.count() > 0:
-                try: loc.first.click(timeout=1000, force=True); return
-                except Exception: pass
-        try: page.keyboard.press("Escape"); return
-        except Exception: pass
-        # 최후 수단: 오버레이 숨김
+                try:
+                    loc.first.click(timeout=1000, force=True)
+                    return
+                except Exception:
+                    pass
+        try:
+            page.keyboard.press("Escape"); return
+        except Exception:
+            pass
+        # 최후: 오버레이 숨김
         page.evaluate("""
         (() => { for (const el of document.querySelectorAll('div')) {
           const r=el.getBoundingClientRect();
@@ -132,7 +168,11 @@ def wait_active_src(page, target_src: str, max_steps: int):
         time.sleep(0.15)
     return False
 
-def click_and_capture_url(page, slide) -> str:
+def click_and_capture_url(page, slide) -> Tuple[str, str]:
+    """
+    반환: (url, note)
+    note에는 팝업/동일탭/실패사유 기록
+    """
     # 컨테이너 중앙 클릭 (상위 핸들러 보장)
     try:
         box = slide.bounding_box()
@@ -145,15 +185,15 @@ def click_and_capture_url(page, slide) -> str:
     # 1) 새 탭
     try:
         with page.expect_popup(timeout=5000) as pop:
-            # 두 번째 클릭(일부 사이트는 첫 클릭에만 focus 변경)
             slide.click(force=True)
         new = pop.value
         new.wait_for_load_state("domcontentloaded", timeout=7000)
         url = new.url
         new.close()
-        return url
-    except Exception:
-        pass
+        return url, "popup"
+    except Exception as e:
+        popup_err = repr(e)
+
     # 2) 동일 탭
     old = page.url
     try:
@@ -162,23 +202,28 @@ def click_and_capture_url(page, slide) -> str:
         if page.url != old:
             url = page.url
             page.go_back(wait_until="domcontentloaded")
-            return url
-    except Exception:
-        pass
-    return ""
+            return url, "same_tab"
+    except Exception as e:
+        same_err = repr(e)
+
+    return "", f"fail: popup={popup_err if 'popup_err' in locals() else ''} same={same_err if 'same_err' in locals() else ''}"
 
 def scrape_banners_via_playwright() -> List[Dict[str,str]]:
     from playwright.sync_api import sync_playwright
+    ensure_debug_dir()
     rows: List[Dict[str,str]] = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         ctx = browser.new_context(user_agent=UA, viewport={"width": 1400, "height": 900})
         page = ctx.new_page()
+
+        # 0) 진입 & 모달처리
         page.goto(BASE_URL, wait_until="domcontentloaded")
         close_modal_if_present(page)
         wait_images_loaded(page)
 
-        total = page.locator(".main-banner-ggs").count()  # ← 신뢰 가능한 총 개수
+        total = page.locator(".main-banner-ggs").count()
         total = max(total, 1)
 
         # 패스1: 고유 슬라이드 모으기
@@ -197,13 +242,38 @@ def scrape_banners_via_playwright() -> List[Dict[str,str]]:
             wait_slide_changed(page, prev, timeout_s=2.5)
             time.sleep(0.15)
 
-        # 패스2: 링크 채우기
-        for title, src in unique:
-            aligned = wait_active_src(page, src, max_steps=total + 6)
-            link = ""
-            if aligned:
-                slide = get_active_slide(page)
-                link = click_and_capture_url(page, slide)
+        write_debug_txt("unique_list.txt", "\n".join([f"{i+1}. {t} | {s}" for i,(t,s) in enumerate(unique)]))
+
+        # 패스2: 링크 채우기 + 슬라이드별 디버그 기록
+        for idx, (title, src) in enumerate(unique, start=1):
+            slug_title = slug(title or f"no_title_{idx}")
+            dbg_name = f"active_src_{idx:02d}_{slug_title}.txt"
+            step_logs = []
+            step_logs.append(f"[STEP] target_idx={idx} title={title}")
+            step_logs.append(f"[STEP] target_src={src}")
+
+            aligned = False
+            try:
+                aligned = wait_active_src(page, src, max_steps=total + 6)
+                step_logs.append(f"[STEP] aligned={aligned}")
+            except Exception as e:
+                step_logs.append(f"[ERR] align_exc={repr(e)}")
+
+            link, note = "", ""
+            try:
+                if aligned:
+                    slide = get_active_slide(page)
+                    link, note = click_and_capture_url(page, slide)
+                    step_logs.append(f"[STEP] click_note={note}")
+                else:
+                    step_logs.append("[WARN] cannot align to target src; skip click")
+            except Exception as e:
+                step_logs.append(f"[ERR] click_exc={repr(e)}\n{traceback.format_exc()}")
+
+            step_logs.append(f"[OUT] Link={link}")
+            write_debug_txt(dbg_name, "\n".join(step_logs))
+            append_jsonl("rows.jsonl", {"idx": idx, "title": title, "src": src, "link": link, "note": note})
+
             rows.append({"Title": title, "Link": link, "Src": src})
 
         browser.close()
@@ -213,7 +283,7 @@ def scrape_banners_via_playwright() -> List[Dict[str,str]]:
 def main():
     rows = scrape_banners_via_playwright()
 
-    # (Title, Src) 기준으로 중복 제거
+    # (Title, Src) 기준으로 유니크
     uniq = {}
     for r in rows:
         key = (r.get("Title") or "", r.get("Src") or "")
