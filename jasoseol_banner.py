@@ -1,7 +1,7 @@
 # jasoseol_banner.py
 import os, time, re, json, pathlib, traceback
 import pandas as pd
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote
 from typing import List, Dict, Tuple
 
 BASE_URL = "https://jasoseol.com/"
@@ -43,9 +43,9 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
     from googleapiclient.http import MediaFileUpload
 
     folder_id = os.environ.get("GDRIVE_FOLDER_ID")
-    drive_id = os.environ.get("GDRIVE_DRIVE_ID")
-    raw_json = os.environ.get("GDRIVE_CREDENTIALS_JSON")
-    sa_path = os.environ.get("GDRIVE_SA_JSON_PATH")
+    drive_id  = os.environ.get("GDRIVE_DRIVE_ID")
+    raw_json  = os.environ.get("GDRIVE_CREDENTIALS_JSON")
+    sa_path   = os.environ.get("GDRIVE_SA_JSON_PATH")
     if not folder_id:
         raise RuntimeError("GDRIVE_FOLDER_ID가 설정되지 않았습니다.")
     scopes = ["https://www.googleapis.com/auth/drive"]
@@ -81,161 +81,159 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
 
 # ------------------------- Playwright helpers -------------------------
 def close_modal_if_present(page) -> None:
-    """첫 진입 모달/광고 팝업을 닫는다(여러 셀렉터 시도 + Escape + 강제 숨김)."""
     try:
         sels = [
             "button:has-text('닫기')", "text=닫기",
             "button:has-text('오늘 하루')", "text=오늘 하루 보지 않기",
             "[aria-label='close']", "[aria-label='Close']",
             "img[alt='close']", "img[alt='Close']",
-            ".modal [role='button']",
         ]
         for s in sels:
             loc = page.locator(s)
             if loc.count() > 0:
                 try:
-                    loc.first.click(timeout=800, force=True)
-                    time.sleep(0.1)
+                    loc.first.click(timeout=1000, force=True)
                     return
                 except Exception:
                     pass
         try:
-            page.keyboard.press("Escape")
-            time.sleep(0.05)
+            page.keyboard.press("Escape"); return
         except Exception:
             pass
-        # 최후: 흔한 오버레이/백드롭 제거
+        # 오버레이 강제 비가시화(최후 수단)
         page.evaluate("""
-        (() => {
-          for (const el of document.querySelectorAll('div,section')) {
-            const r = el.getBoundingClientRect();
-            const c = String(el.className||'');
-            if ((r.width>=400 && r.height>=200) && (c.includes('overflow-hidden')||c.includes('fixed')||c.includes('backdrop')||c.includes('modal'))) {
-              el.style.setProperty('display','none','important');
-            }
+        (() => { for (const el of document.querySelectorAll('div')) {
+          const r=el.getBoundingClientRect();
+          const c=String(el.className||'');
+          if ((r.width>=400 && r.height>=200) && (c.includes('overflow-hidden')||c.includes('fixed')||c.includes('backdrop'))) {
+            el.style.setProperty('display','none','important');
           }
-        })()
+        } })()
         """)
     except Exception:
         pass
 
-def get_slides_locator(page):
-    return page.locator(".main-banner-ggs")
+def get_active_slide(page):
+    loc = page.locator(".main-banner-ggs.opacity-100").first
+    if loc.count()==0: loc = page.locator(".main-banner-ggs.z-1").first
+    if loc.count()==0: loc = page.locator(".main-banner-ggs").first
+    return loc
+
+def read_slide_signature(slide) -> Tuple[str,str]:
+    title, src = "", ""
+    try:
+        img = slide.locator("img").first
+        title = (img.get_attribute("alt") or "").strip()
+        src = unquote(img.get_attribute("src") or "")
+    except Exception:
+        pass
+    return title, src
+
+def go_next(page):
+    # 키보드가 슬라이더에 잘 먹어서 기본을 ArrowRight로
+    try: page.keyboard.press("ArrowRight")
+    except Exception: pass
 
 def wait_images_loaded(page):
-    page.wait_for_selector(".main-banner-ggs img", timeout=15000)
+    page.wait_for_selector(".main-banner-ggs img", timeout=12000)
     page.wait_for_function(
         """() => {
           const imgs = Array.from(document.querySelectorAll('.main-banner-ggs img'));
           return imgs.length>0 && imgs.every(i => i.getAttribute('src'));
-        }""",
-        timeout=15000
+        }""", timeout=12000
     )
 
-def read_slide_signature_by_index(page, idx: int) -> Tuple[str, str]:
-    """nth(idx) 슬라이드에서 alt/src 추출 (화면에 보이든 말든)"""
-    try:
-        item = get_slides_locator(page).nth(idx)
-        img = item.locator("img").first
-        title = (img.get_attribute("alt") or "").strip()
-        src = unquote(img.get_attribute("src") or "")
-        return title, src
-    except Exception:
-        return "", ""
-
-def go_next(page):
-    """오른쪽 화살표(없으면 키보드)"""
-    try:
-        arrow = page.locator("img[alt='right icon'], img[src*='ic_arrow_right']").first
-        if arrow.count()>0:
-            arrow.click(force=True)
-            return
-    except Exception:
-        pass
-    try:
-        page.keyboard.press("ArrowRight")
-    except Exception:
-        pass
-
-def align_to_index(page, target_idx: int, total: int, step_log: list):
-    """
-    현재 active 기준이 불명확할 수 있어서,
-    '총 슬라이드 수만큼 우측 이동'을 최대 2회 반복하며 대상 인덱스의 src가 화면 중앙에 나올 때까지 시도.
-    """
-    for loop in range(2):  # 최대 2바퀴
-        for _ in range(total+2):
-            # 현재 중앙 슬라이드의 src
-            # heuristic: opacity가 가장 큰 요소를 중앙으로 간주
-            cand = page.locator(".main-banner-ggs.opacity-100,.main-banner-ggs.z-1").first
-            if cand.count()==0:
-                cand = page.locator(".main-banner-ggs").first
-            cur_img = cand.locator("img").first
-            cur_src = unquote(cur_img.get_attribute("src") or "")
-            # 대상 인덱스의 src
-            _, target_src = read_slide_signature_by_index(page, target_idx)
-            if target_src and cur_src and (os.path.basename(cur_src)==os.path.basename(target_src)):
-                step_log.append(f"[ALIGN] matched cur={os.path.basename(cur_src)} target={os.path.basename(target_src)}")
-                return True
-            go_next(page)
-            time.sleep(0.15)
-    step_log.append("[ALIGN] failed")
+def wait_slide_changed(page, prev_src: str, timeout_s=3.0):
+    t0 = time.time()
+    while time.time()-t0 < timeout_s:
+        cur = read_slide_signature(get_active_slide(page))[1]
+        if cur and cur != prev_src: return True
+        time.sleep(0.05)
     return False
 
-def capture_link_after_click(page, slide, step_log: list) -> Tuple[str, str]:
-    """
-    클릭 후 URL을 포착. 우선 팝업, 실패 시 동일탭 내비게이션.
-    반환: (url, how)  how ∈ {"popup","same_tab",""} 
-    """
-    # 클릭 전에 모달/오버레이 한 번 더 방어
-    close_modal_if_present(page)
-    page.wait_for_timeout(50)
+def wait_active_src(page, target_src: str, max_steps: int):
+    for _ in range(max_steps):
+        t, s = read_slide_signature(get_active_slide(page))
+        if s == target_src: return True
+        prev = s
+        go_next(page)
+        wait_slide_changed(page, prev, timeout_s=2.5)
+        time.sleep(0.12)
+    return False
 
-    # 뷰포트 내로
+def _center_click_and_wait(page, img_locator):
+    """
+    이미지 박스 중심을 실클릭(mouse)하고,
+    팝업/동일탭 모두를 감지하여 URL을 반환.
+    """
+    url = ""
+    box = None
     try:
-        slide.scroll_into_view_if_needed(timeout=1000)
+        img_locator.scroll_into_view_if_needed(timeout=1500)
     except Exception:
         pass
 
-    # 1) popup 시나리오
     try:
-        with page.expect_popup(timeout=3500) as pop_waiter:
-            slide.click(force=True)
-        new_page = pop_waiter.value
-        new_page.wait_for_load_state("domcontentloaded", timeout=7000)
-        url = new_page.url
-        step_log.append(f"[CLICK] popup url={url}")
-        new_page.close()
-        return url, "popup"
-    except Exception as e:
-        step_log.append(f"[CLICK] popup miss: {repr(e)}")
+        box = img_locator.bounding_box()
+    except Exception:
+        box = None
 
-    # 2) same-tab 시나리오
+    # 박스 정보 기록용 반환
+    box_info = f"box={box}" if box else "box=None"
+
+    # 새 탭/동일 탭 동시 감시
+    popup_promise = page.expect_popup(timeout=3500)
+    nav_happened = False
     try:
-        with page.expect_navigation(wait_until="domcontentloaded", timeout=5000):
-            slide.click(force=True)
-        url = page.url
-        step_log.append(f"[CLICK] same_tab url={url}")
-        page.go_back(wait_until="domcontentloaded")
-        return url, "same_tab"
+        old = page.url
+        if box:
+            page.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
+        else:
+            # 박스를 못 구하면 programmatic click
+            page.evaluate("(el)=>el.click()", img_locator.element_handle(timeout=1500))
+
+        # 팝업 우선 수거
+        try:
+            new = popup_promise.value
+        except Exception:
+            new = None
+
+        if new is None:
+            # 동일 탭 이동 감시
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=3500)
+                nav_happened = (page.url != old)
+            except Exception:
+                nav_happened = False
+
+        if new is not None:
+            new.wait_for_load_state("domcontentloaded", timeout=5000)
+            url = new.url
+            new.close()
+            how = f"popup | {box_info}"
+        elif nav_happened:
+            url = page.url
+            how = f"same_tab | {box_info}"
+            # 돌아가기
+            try:
+                page.go_back(wait_until="domcontentloaded")
+            except Exception:
+                pass
+        else:
+            how = f"no_nav | {box_info}"
     except Exception as e:
-        step_log.append(f"[CLICK] same_tab miss: {repr(e)}")
+        how = f"click_err={repr(e)} | {box_info}"
+    return url, how
 
-    # 3) 마지막 시도: JS 핸들러가 a.href를 들고 있을 수도 → href 추출 후 강제 window.open
-    try:
-        href = slide.evaluate("""(el)=>{
-          // el 내부에 a가 있으면 우선 사용
-          const a = el.querySelector('a[href]');
-          return a ? a.href : '';
-        }""")
-        if href:
-            step_log.append(f"[CLICK] fallback href sniffed={href}")
-            return href, "sniff"
-    except Exception as e:
-        step_log.append(f"[CLICK] sniff miss: {repr(e)}")
+def click_and_capture_url(page, slide) -> Tuple[str, str]:
+    """
+    활성 슬라이드 내부 IMG를 중심-클릭하여 URL을 얻는다.
+    (컨테이너 div는 박스가 0인 경우가 있어 img를 사용)
+    """
+    img = slide.locator("img").first
+    return _center_click_and_wait(page, img)
 
-    return "", ""
-
-# ------------------------- Scraper -------------------------
+# ------------------------- Scraping -------------------------
 def scrape_banners_via_playwright() -> List[Dict[str,str]]:
     from playwright.sync_api import sync_playwright
     ensure_debug_dir()
@@ -251,49 +249,57 @@ def scrape_banners_via_playwright() -> List[Dict[str,str]]:
         close_modal_if_present(page)
         wait_images_loaded(page)
 
-        slides = get_slides_locator(page)
-        total = slides.count()
+        total = page.locator(".main-banner-ggs").count()
         total = max(total, 1)
 
-        # Pass 1: 모든 슬라이드의 (index, title, src) 캐시
-        unique: List[Tuple[int,str,str]] = []  # (idx, title, src)
-        for i in range(total):
-            title, src = read_slide_signature_by_index(page, i)
-            if not src:
-                continue
-            # 같은 Src는 건너뛰기(질문 페이지에서 15~16개 고유 이미지)
-            if not any(os.path.basename(src)==os.path.basename(s2) for _,_,s2 in unique):
-                unique.append((i, title, src))
-        write_debug_txt(
-            "unique_list.txt",
-            "\n".join([f"{i+1}. idx={idx} | {title} | {src}" for i,(idx,title,src) in enumerate(unique)])
-        )
+        # 패스1: 고유 슬라이드 수집
+        seen = set()
+        unique: List[Tuple[str,str]] = []
+        guard = 0
+        while len(unique) < total and guard < total * 5:
+            guard += 1
+            slide = get_active_slide(page)
+            title, src = read_slide_signature(slide)
+            if src and (title, src) not in seen:
+                seen.add((title, src))
+                unique.append((title, src))
+            prev = src
+            go_next(page)
+            wait_slide_changed(page, prev, timeout_s=2.5)
+            time.sleep(0.10)
 
-        # Pass 2: 각 인덱스로 정렬 → 클릭 → URL 포착
-        for ord_i, (idx, title, src) in enumerate(unique, start=1):
-            step_logs = [f"[STEP] order={ord_i} dom_idx={idx}",
-                         f"[STEP] title={title}",
-                         f"[STEP] src={src}"]
-            slug_title = slug(title or f"no_title_{ord_i}")
-            dbg_name = f"active_src_{ord_i:02d}_{slug_title}.txt"
+        write_debug_txt("unique_list.txt", "\n".join([f"{i+1}. {t} | {s}" for i,(t,s) in enumerate(unique)]))
 
-            # 정렬
-            aligned = align_to_index(page, idx, total, step_logs)
+        # 패스2: 정렬→클릭→URL
+        for idx, (title, src) in enumerate(unique, start=1):
+            slug_title = slug(title or f"no_title_{idx}")
+            dbg_name = f"active_src_{idx:02d}_{slug_title}.txt"
+            step_logs = []
+            step_logs.append(f"[STEP] order={idx}")
+            step_logs.append(f"[STEP] title={title}")
+            step_logs.append(f"[STEP] src={src}")
 
-            link, how = "", ""
+            aligned = False
+            try:
+                aligned = wait_active_src(page, src, max_steps=total + 6)
+                step_logs.append(f"[ALIGN] aligned={aligned}")
+            except Exception as e:
+                step_logs.append(f"[ALIGN] exc={repr(e)}")
+
+            link, note = "", ""
             try:
                 if aligned:
-                    slide = slides.nth(idx)
-                    link, how = capture_link_after_click(page, slide, step_logs)
+                    slide = get_active_slide(page)
+                    link, note = click_and_capture_url(page, slide)
+                    step_logs.append(f"[CLICK] {note}")
                 else:
-                    step_logs.append("[WARN] alignment failed → skip click")
+                    step_logs.append("[WARN] cannot align -> skip click")
             except Exception as e:
                 step_logs.append(f"[ERR] click_exc={repr(e)}\n{traceback.format_exc()}")
 
-            step_logs.append(f"[OUT] Link={link} how={how}")
+            step_logs.append(f"[OUT] Link={link}")
             write_debug_txt(dbg_name, "\n".join(step_logs))
-            append_jsonl("rows.jsonl", {"order": ord_i, "idx": idx, "title": title,
-                                        "src": src, "link": link, "how": how})
+            append_jsonl("rows.jsonl", {"idx": idx, "title": title, "src": src, "link": link, "note": note})
 
             rows.append({"Title": title, "Link": link, "Src": src})
 
@@ -304,7 +310,7 @@ def scrape_banners_via_playwright() -> List[Dict[str,str]]:
 def main():
     rows = scrape_banners_via_playwright()
 
-    # (Title, Src) 기준으로 유니크 정리
+    # (Title, Src) 기준으로 유니크
     uniq = {}
     for r in rows:
         key = (r.get("Title") or "", r.get("Src") or "")
