@@ -1,5 +1,5 @@
 # jasoseol_banner.py
-import os, time, re, json, pathlib, traceback
+import os, time, re, json, pathlib, traceback, datetime as dt
 import pandas as pd
 from urllib.parse import unquote
 from typing import List, Dict, Tuple
@@ -15,7 +15,7 @@ DEBUG_DIR = pathlib.Path("debug")
 def ensure_debug_dir():
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-def slug(s: str, maxlen: int = 60) -> str:
+def slug(s: str, maxlen: int = 80) -> str:
     s = re.sub(r"[^0-9A-Za-z가-힣_]+", "_", s or "").strip("_")
     return (s[:maxlen] or "no_title")
 
@@ -43,9 +43,9 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
     from googleapiclient.http import MediaFileUpload
 
     folder_id = os.environ.get("GDRIVE_FOLDER_ID")
-    drive_id  = os.environ.get("GDRIVE_DRIVE_ID")
-    raw_json  = os.environ.get("GDRIVE_CREDENTIALS_JSON")
-    sa_path   = os.environ.get("GDRIVE_SA_JSON_PATH")
+    drive_id = os.environ.get("GDRIVE_DRIVE_ID")
+    raw_json = os.environ.get("GDRIVE_CREDENTIALS_JSON")
+    sa_path = os.environ.get("GDRIVE_SA_JSON_PATH")
     if not folder_id:
         raise RuntimeError("GDRIVE_FOLDER_ID가 설정되지 않았습니다.")
     scopes = ["https://www.googleapis.com/auth/drive"]
@@ -82,34 +82,46 @@ def upload_to_gdrive(local_path: str, filename: str) -> str:
 # ------------------------- Playwright helpers -------------------------
 def close_modal_if_present(page) -> None:
     try:
+        # 빠르게 닫기 버튼 후보들
         sels = [
             "button:has-text('닫기')", "text=닫기",
             "button:has-text('오늘 하루')", "text=오늘 하루 보지 않기",
             "[aria-label='close']", "[aria-label='Close']",
             "img[alt='close']", "img[alt='Close']",
+            ".fixed .cursor-pointer:has(img[alt*='close'])",
         ]
         for s in sels:
             loc = page.locator(s)
             if loc.count() > 0:
                 try:
-                    loc.first.click(timeout=1000, force=True)
+                    loc.first.click(timeout=800, force=True)
+                    time.sleep(0.3)
                     return
                 except Exception:
                     pass
+        # ESC 시도
         try:
-            page.keyboard.press("Escape"); return
+            page.keyboard.press("Escape")
+            time.sleep(0.25)
+            return
         except Exception:
             pass
-        # 오버레이 강제 비가시화(최후 수단)
+        # 최후: 화면 덮개 숨김
         page.evaluate("""
         (() => { for (const el of document.querySelectorAll('div')) {
-          const r=el.getBoundingClientRect();
-          const c=String(el.className||'');
-          if ((r.width>=400 && r.height>=200) && (c.includes('overflow-hidden')||c.includes('fixed')||c.includes('backdrop'))) {
+          const r = el.getBoundingClientRect();
+          const cls = String(el.className||'');
+          const style = window.getComputedStyle(el);
+          const z = parseInt(style.zIndex||'0',10);
+          if ((r.width>=400 && r.height>=200) &&
+              (cls.includes('overflow-hidden')||cls.includes('fixed')||cls.includes('backdrop')||z>1000)) {
             el.style.setProperty('display','none','important');
+            el.style.setProperty('visibility','hidden','important');
+            el.style.setProperty('pointer-events','none','important');
           }
         } })()
         """)
+        time.sleep(0.2)
     except Exception:
         pass
 
@@ -130,17 +142,37 @@ def read_slide_signature(slide) -> Tuple[str,str]:
     return title, src
 
 def go_next(page):
-    # 키보드가 슬라이더에 잘 먹어서 기본을 ArrowRight로
-    try: page.keyboard.press("ArrowRight")
-    except Exception: pass
+    # 우측 화살표 우선
+    try:
+        nxt = page.locator("img[alt='right icon'], img[src*='ic_arrow_right']").first
+        if nxt.count()>0:
+            nxt.click(force=True)
+            return
+    except Exception:
+        pass
+    # 컨테이너 오른쪽 영역 클릭(드래그 캡처 회피)
+    try:
+        cont = page.locator(".relative.box-border.w-\\[1200px\\].h-\\[280px\\]").first
+        if cont.count()>0:
+            box = cont.bounding_box() or {}
+            if box:
+                page.mouse.click(box["x"] + box["width"]*0.9, box["y"] + box["height"]/2)
+                return
+    except Exception:
+        pass
+    # 키보드
+    try:
+        page.keyboard.press("ArrowRight")
+    except Exception:
+        pass
 
 def wait_images_loaded(page):
-    page.wait_for_selector(".main-banner-ggs img", timeout=12000)
+    page.wait_for_selector(".main-banner-ggs img", timeout=15000)
     page.wait_for_function(
         """() => {
           const imgs = Array.from(document.querySelectorAll('.main-banner-ggs img'));
           return imgs.length>0 && imgs.every(i => i.getAttribute('src'));
-        }""", timeout=12000
+        }""", timeout=15000
     )
 
 def wait_slide_changed(page, prev_src: str, timeout_s=3.0):
@@ -148,7 +180,7 @@ def wait_slide_changed(page, prev_src: str, timeout_s=3.0):
     while time.time()-t0 < timeout_s:
         cur = read_slide_signature(get_active_slide(page))[1]
         if cur and cur != prev_src: return True
-        time.sleep(0.05)
+        time.sleep(0.06)
     return False
 
 def wait_active_src(page, target_src: str, max_steps: int):
@@ -157,83 +189,108 @@ def wait_active_src(page, target_src: str, max_steps: int):
         if s == target_src: return True
         prev = s
         go_next(page)
-        wait_slide_changed(page, prev, timeout_s=2.5)
+        wait_slide_changed(page, prev, timeout_s=2.8)
         time.sleep(0.12)
     return False
 
-def _center_click_and_wait(page, img_locator):
+def _wait_url_change(page, old_url: str, timeout_s: float = 8.0) -> bool:
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        if page.url != old_url:
+            return True
+        time.sleep(0.15)
+    return False
+
+def _click_topmost_via_element_from_point(page, x, y):
+    # elementFromPoint를 통한 최상단 요소에 직접 click 이벤트 디스패치
+    return page.evaluate("""([x, y]) => {
+      const el = document.elementFromPoint(x, y);
+      if (!el) return { ok:false, why:'no_element' };
+      const evt = new MouseEvent('click', {bubbles:true, cancelable:true, view:window});
+      const ok = el.dispatchEvent(evt);
+      return { ok, tag: el.tagName, cls: (el.className||'').toString() };
+    }""", [x, y])
+
+def click_and_capture_url(page, slide, step_logs) -> Tuple[str, str]:
     """
-    이미지 박스 중심을 실클릭(mouse)하고,
-    팝업/동일탭 모두를 감지하여 URL을 반환.
+    반환: (url, note)
+    note: popup|same_tab|efp_popup|efp_same_tab|no_nav|fail:...
     """
-    url = ""
-    box = None
+    link, note = "", ""
+
+    # 공통: 중앙 좌표 계산
+    box = slide.bounding_box() or {}
+    cx = box.get("x", 0) + box.get("width", 0)/2 if box else 700
+    cy = box.get("y", 0) + box.get("height", 0)/2 if box else 260
+
+    # ========== 경로 1) 일반 마우스 클릭 시도 ==========
     try:
-        img_locator.scroll_into_view_if_needed(timeout=1500)
-    except Exception:
-        pass
+        # 팝업 탭
+        with page.expect_popup(timeout=2500) as pop:
+            page.mouse.click(cx, cy)
+        new = pop.value
+        new.wait_for_load_state("domcontentloaded", timeout=7000)
+        link = new.url
+        new.close()
+        step_logs.append(f"[CLICK] mouse_center popup | box={box}")
+        return link, "popup"
+    except Exception as e_popup_mouse:
+        step_logs.append(f"[CLICK] mouse_center popup_fail | {repr(e_popup_mouse)} | box={box}")
 
+    # 동일 탭 이동
+    old = page.url
     try:
-        box = img_locator.bounding_box()
-    except Exception:
-        box = None
-
-    # 박스 정보 기록용 반환
-    box_info = f"box={box}" if box else "box=None"
-
-    # 새 탭/동일 탭 동시 감시
-    popup_promise = page.expect_popup(timeout=3500)
-    nav_happened = False
-    try:
-        old = page.url
-        if box:
-            page.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
-        else:
-            # 박스를 못 구하면 programmatic click
-            page.evaluate("(el)=>el.click()", img_locator.element_handle(timeout=1500))
-
-        # 팝업 우선 수거
-        try:
-            new = popup_promise.value
-        except Exception:
-            new = None
-
-        if new is None:
-            # 동일 탭 이동 감시
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=3500)
-                nav_happened = (page.url != old)
-            except Exception:
-                nav_happened = False
-
-        if new is not None:
-            new.wait_for_load_state("domcontentloaded", timeout=5000)
-            url = new.url
-            new.close()
-            how = f"popup | {box_info}"
-        elif nav_happened:
-            url = page.url
-            how = f"same_tab | {box_info}"
-            # 돌아가기
+        page.mouse.click(cx, cy)
+        changed = _wait_url_change(page, old, timeout_s=8.0)
+        if changed and page.url != old:
+            link = page.url
+            step_logs.append(f"[CLICK] mouse_center same_tab | url={link}")
+            # 뒤로 가서 배너로 복귀
             try:
                 page.go_back(wait_until="domcontentloaded")
+                time.sleep(0.4)
             except Exception:
                 pass
-        else:
-            how = f"no_nav | {box_info}"
-    except Exception as e:
-        how = f"click_err={repr(e)} | {box_info}"
-    return url, how
+            return link, "same_tab"
+    except Exception as e_same_mouse:
+        step_logs.append(f"[CLICK] mouse_center same_tab_fail | {repr(e_same_mouse)}")
 
-def click_and_capture_url(page, slide) -> Tuple[str, str]:
-    """
-    활성 슬라이드 내부 IMG를 중심-클릭하여 URL을 얻는다.
-    (컨테이너 div는 박스가 0인 경우가 있어 img를 사용)
-    """
-    img = slide.locator("img").first
-    return _center_click_and_wait(page, img)
+    # ========== 경로 2) elementFromPoint 폴백 클릭 ==========
+    try:
+        # 팝업 탭
+        with page.expect_popup(timeout=2500) as pop:
+            r = _click_topmost_via_element_from_point(page, cx, cy)
+            step_logs.append(f"[CLICK] efp_topmost popup_try | efp_result={r}")
+        new = pop.value
+        new.wait_for_load_state("domcontentloaded", timeout=7000)
+        link = new.url
+        new.close()
+        step_logs.append(f"[CLICK] efp_topmost popup | url={link}")
+        return link, "efp_popup"
+    except Exception as e_popup_efp:
+        step_logs.append(f"[CLICK] efp_topmost popup_fail | {repr(e_popup_efp)}")
 
-# ------------------------- Scraping -------------------------
+    # 동일 탭 이동
+    try:
+        old = page.url
+        r = _click_topmost_via_element_from_point(page, cx, cy)
+        step_logs.append(f"[CLICK] efp_topmost same_try | efp_result={r}")
+        changed = _wait_url_change(page, old, timeout_s=8.0)
+        if changed and page.url != old:
+            link = page.url
+            step_logs.append(f"[CLICK] efp_topmost same_tab | url={link}")
+            try:
+                page.go_back(wait_until="domcontentloaded")
+                time.sleep(0.4)
+            except Exception:
+                pass
+            return link, "efp_same_tab"
+    except Exception as e_same_efp:
+        step_logs.append(f"[CLICK] efp_topmost same_tab_fail | {repr(e_same_efp)}")
+
+    step_logs.append(f"[CLICK] no_nav | box={box}")
+    return "", "no_nav"
+
 def scrape_banners_via_playwright() -> List[Dict[str,str]]:
     from playwright.sync_api import sync_playwright
     ensure_debug_dir()
@@ -246,6 +303,7 @@ def scrape_banners_via_playwright() -> List[Dict[str,str]]:
 
         # 0) 진입 & 모달처리
         page.goto(BASE_URL, wait_until="domcontentloaded")
+        time.sleep(0.6)
         close_modal_if_present(page)
         wait_images_loaded(page)
 
@@ -265,35 +323,35 @@ def scrape_banners_via_playwright() -> List[Dict[str,str]]:
                 unique.append((title, src))
             prev = src
             go_next(page)
-            wait_slide_changed(page, prev, timeout_s=2.5)
-            time.sleep(0.10)
+            wait_slide_changed(page, prev, timeout_s=3.2)
+            time.sleep(0.12)
 
         write_debug_txt("unique_list.txt", "\n".join([f"{i+1}. {t} | {s}" for i,(t,s) in enumerate(unique)]))
 
-        # 패스2: 정렬→클릭→URL
+        # 패스2: 각 슬라이드 정렬 → 클릭 → 링크 획득
         for idx, (title, src) in enumerate(unique, start=1):
             slug_title = slug(title or f"no_title_{idx}")
             dbg_name = f"active_src_{idx:02d}_{slug_title}.txt"
             step_logs = []
-            step_logs.append(f"[STEP] order={idx}")
+            step_logs.append(f"[TIME_UTC] {dt.datetime.utcnow().isoformat()}Z")
+            step_logs.append(f"[STEP] target_idx={idx}")
             step_logs.append(f"[STEP] title={title}")
             step_logs.append(f"[STEP] src={src}")
 
             aligned = False
             try:
-                aligned = wait_active_src(page, src, max_steps=total + 6)
-                step_logs.append(f"[ALIGN] aligned={aligned}")
+                aligned = wait_active_src(page, src, max_steps=total + 8)
+                step_logs.append(f"[STEP] aligned={aligned}")
             except Exception as e:
-                step_logs.append(f"[ALIGN] exc={repr(e)}")
+                step_logs.append(f"[ERR] align_exc={repr(e)}")
 
             link, note = "", ""
             try:
                 if aligned:
                     slide = get_active_slide(page)
-                    link, note = click_and_capture_url(page, slide)
-                    step_logs.append(f"[CLICK] {note}")
+                    link, note = click_and_capture_url(page, slide, step_logs)
                 else:
-                    step_logs.append("[WARN] cannot align -> skip click")
+                    step_logs.append("[WARN] cannot align to target src; skip click")
             except Exception as e:
                 step_logs.append(f"[ERR] click_exc={repr(e)}\n{traceback.format_exc()}")
 
@@ -310,11 +368,12 @@ def scrape_banners_via_playwright() -> List[Dict[str,str]]:
 def main():
     rows = scrape_banners_via_playwright()
 
-    # (Title, Src) 기준으로 유니크
+    # (Title, Src) 기준 유니크 정리
     uniq = {}
     for r in rows:
         key = (r.get("Title") or "", r.get("Src") or "")
-        if key not in uniq:
+        if key not in uniq or (not uniq[key].get("Link") and r.get("Link")):
+            # 링크가 채워진 쪽을 우선
             uniq[key] = r
     final = list(uniq.values())
 
